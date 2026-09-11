@@ -46,6 +46,7 @@ export type PlantModelName =
     | "cauliflower"
     | "chilli"
     | "lemon"
+    | "potato"
     | "maize"
     | "tea"
     | "tomato"

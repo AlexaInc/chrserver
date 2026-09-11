@@ -58,7 +58,7 @@ export class Server {
                     logger.debug("upload request");
 
                     const file = req.file;
-                    console.log(req.body.plant)
+                    logger.debug(req.body.plant)
                     const otherData = req.body.someTextField;
 
                     if (!file) {

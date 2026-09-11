@@ -30,6 +30,12 @@
       "inputSize": 256,
       "classCount": 19
     },
+    "potato": {
+      "modelUrl": "potato/model.json",
+      "classesUrl": "potato/classes.json",
+      "inputSize": 256,
+      "classCount": 3
+    },
     "tea": {
       "modelUrl": "tea/model.json",
       "classesUrl": "tea/classes.json",
