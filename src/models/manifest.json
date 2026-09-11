@@ -1,0 +1,50 @@
+{
+  "models": {
+    "apple": {
+      "modelUrl": "apple/model.json",
+      "classesUrl": "apple/classes.json",
+      "inputSize": 256,
+      "classCount": 4
+    },
+    "blueberry": {
+      "modelUrl": "blueberry/model.json",
+      "classesUrl": "blueberry/classes.json",
+      "inputSize": 256,
+      "classCount": 1
+    },
+    "cauliflower": {
+      "modelUrl": "cauliflower/model.json",
+      "classesUrl": "cauliflower/classes.json",
+      "inputSize": 256,
+      "classCount": 4
+    },
+    "chilli": {
+      "modelUrl": "chilli/model.json",
+      "classesUrl": "chilli/classes.json",
+      "inputSize": 256,
+      "classCount": 6
+    },
+    "lemon": {
+      "modelUrl": "lemon/model.json",
+      "classesUrl": "lemon/classes.json",
+      "inputSize": 256,
+      "classCount": 19
+    },
+    "tea": {
+      "modelUrl": "tea/model.json",
+      "classesUrl": "tea/classes.json",
+      "inputSize": 256,
+      "classCount": 11
+    },
+    "tomato": {
+      "modelUrl": "tomato/model.json",
+      "classesUrl": "tomato/classes.json",
+      "inputSize": 256,
+      "classCount": 10
+    }
+  },
+  "skipped": {
+    "banana": "requires *_model.keras or model_weights plus class_names.npz",
+    "maize": "requires *_model.keras or model_weights plus class_names.npz"
+  }
+}

@@ -1,6 +1,17 @@
 import express, { Response, Request, Express, NextFunction } from 'express';
 import { logger } from "./index";
+import multer from 'multer';
+import { Sequential } from '@tensorflow/tfjs';
+import {
+    predictPlant
+} from "./services/LoadAimodels";
+export interface PlantModelData {
+    plant: string;
+    model: Sequential;
+    classes: string[];
 
+}
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 export interface ServerConfig {
     port:  number;
     domain: string;
@@ -11,9 +22,12 @@ export class Server {
     public port:  number;
     domain: string;
 
+    models :PlantModelData | null;
+
     constructor({ port, domain }: ServerConfig) {
         this.app = express();
         this.port = port;
+        this.models = null ;
         this.domain = domain;
     }
 
@@ -24,7 +38,8 @@ export class Server {
         return this;
     }
 
-    setupRoutes(): this {
+    setupRoutes(options:any ): this {
+        this.models = options["models"];
         this.app.post("/auth/login", (req: Request, res: Response, next: NextFunction):void => {
             try {
                 logger.info("login request");
@@ -35,55 +50,78 @@ export class Server {
             }
         });
 
-        this.app.post("/api/images/upload", (req: Request, res: Response, next: NextFunction):Response<any, Record<string, any>> | undefined => {
-            try {
-                logger.info("upload request");
+        this.app.post(
+            "/api/images/upload",
+            upload.single('file'),
+            async (req: Request, res: Response, next: NextFunction): Promise<Response<any, Record<string, any>> | undefined> => {
+                try {
+                    logger.debug("upload request");
 
-                const file = req?.body?.file;
+                    const file = req.file;
+                    console.log(req.body.plant)
+                    const otherData = req.body.someTextField;
 
-                // 1. Check if file object exists
-                if (!file) {
-                    return res.status(400).send({
-                        "ok": false,
-                        "error": "Bad Request",
-                        "message": "Missing file payload in request body"
+                    if (!file) {
+                        return res.status(400).send({
+                            "ok": false,
+                            "error": "Bad Request",
+                            "message": "Missing file payload in request body"
+                        });
+                    }
+
+                    const validTypes = ["image/jpg", "image/png", "image/jpeg"];
+                    if (!validTypes.includes(file.mimetype)) {
+                        return res.status(415).send({
+                            "ok": false,
+                            "error": "Unsupported Media Type",
+                            "message": "Invalid file type, only support png or jpg"
+                        });
+                    }
+
+                    if (!file.buffer) {
+                        return res.status(400).send({
+                            "ok": false,
+                            "error": "Bad Request",
+                            "message": "Buffer is empty"
+                        });
+                    }
+                    if (!this.models) {
+                        return res.status(500).send({
+                            "ok": false,
+                            "message": "Internal Server Error",
+                            "reason": "models not loaded yet"
+                        });
+                    }
+                    if(!req.body.plant){
+                        return res.status(400).send({
+                            "ok": false,
+                            "error": "Bad Request",
+                            "reason": "Missing plant name payload in request body"
+                        })
+                    }
+                    const found = (this.models as unknown as PlantModelData[]).find((item) => item.plant === req.body.plant);
+
+                    if (!found) {
+                        return res.status(404).send({
+                            "ok": false,
+                            "message": "Not Found",
+                            "reason": "apple model not found"
+                        });
+                    }
+
+
+                    const predictions = await predictPlant(found, file.buffer, 5);
+                    return res.status(200).send({
+                        "ok": true,
+                        "message": "Image uploaded and processed successfully",
+                        "result": predictions
                     });
+
+                } catch (error) {
+                    next(error);
                 }
-
-
-
-                // 2. Validate file type
-                const validTypes = ["image/jpg", "image/png", "image/jpeg"];
-                if (!validTypes.includes(file.type)) {
-                    return res.status(415).send({
-                        "ok": false,
-                        "error": "Unsupported Media Type",
-                        "message": "Invalid file type, only support png or jpg"
-                    });
-                }
-
-                // 3. Validate buffer existence
-                if (!file.buffer) {
-                    return res.status(400).send({
-                        "ok": false,
-                        "error": "Bad Request",
-                        "message": "Buffer is empty"
-                    });
-                }
-
-                logger.info("File buffer received successfully");
-
-                // 4. Send success response
-                return res.status(200).send({
-                    "ok": true,
-                    "message": "Image uploaded and processed successfully"
-                });
-
-            } catch (error) {
-                // Forward any unexpected errors to the global error handler
-                next(error);
             }
-        });
+        );
 
         this.app.post('/api/robot/command',(req: Request, res: Response, next: NextFunction):void => {
             logger.info("robot request");

@@ -10,8 +10,11 @@ class TFNormalizationLayer extends tf.layers.Layer {
         super(config);
     }
     override build(inputShape: tf.Shape | tf.Shape[]) {
+        // @ts-ignore
         this.addWeight('mean', [3], 'float32', tf.initializers.zeros(), true);
+        // @ts-ignore
         this.addWeight('variance', [3], 'float32', tf.initializers.ones(), true);
+        // @ts-ignore
         this.addWeight('count', [], 'int32', tf.initializers.zeros(), false);
         super.build(inputShape);
     }
@@ -53,6 +56,10 @@ export interface PlantModel {
     classes: string[];
 }
 
+export interface LoadedPlantModel extends PlantModel {
+    plant: PlantModelName;
+}
+
 interface ModelManifestEntry {
     modelUrl: string;
     classesUrl: string;
@@ -76,6 +83,21 @@ export async function loadPlantModel(
     const loading = loadPlantModelUncached(plant, key);
     cache.set(key, loading);
     return loading;
+}
+
+export async function loadAllPlantModels(
+    modelsDirectory = path.resolve("../models"),
+): Promise<LoadedPlantModel[]> {
+    const manifestPath = path.join(path.resolve(modelsDirectory), "manifest.json");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as ModelManifest;
+    const plants = Object.keys(manifest.models) as PlantModelName[];
+
+    return Promise.all(
+        plants.map(async (plant) => ({
+            plant,
+            ...(await loadPlantModel(plant, modelsDirectory)),
+        })),
+    );
 }
 
 async function loadPlantModelUncached(
@@ -110,7 +132,6 @@ export async function imageToTensor(
         .toBuffer({ resolveWithObject: true });
 
     return tf.tidy(() => {
-        // දත්ත වර්ගය මුල සිටම float32 ලෙස ලබා දී weight loading වලදී dtype error එන එක සම්පූර්ණයෙන්ම වළක්වයි
         const tensor = tf.tensor3d(
             new Float32Array(new Uint8Array(data)),
             [info.height, info.width, 3],

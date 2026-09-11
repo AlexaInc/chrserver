@@ -63,13 +63,15 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
 ## Architecture
 
 ```
-                       ┌─────────────────────────────┐
-   Sensors + AI Camera │        ESP32-S3 Robot        │
-   (soil, DHT22, etc.) │  (Socket.IO client "esp_32") │
-                       └───────────────┬──────────────┘
-                                       │  esp_32_message  ▲ control_command
-                                       ▼                  │
-                        ┌──────────────────────────────────────────┐
+                           ┌───────────────────────────────┐
+   Sensors + AI Camera     │        ESP32-S3 Robot         │
+   (soil, DHT22, etc.)     │  (Socket.IO client "esp_32")  │
+                           └─────┬─────────────────────────┘
+                                 │                   ▲ 
+                           esp_32_message            │
+                                 │           control_command
+                                 ▼                   │
+                        ┌───────────────────────────────────────────┐
                         │              chrserver (this)             │
                         │  ┌────────────┐        ┌───────────────┐  │
                         │  │ Express    │        │  Socket.IO    │  │
@@ -77,12 +79,14 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
                         │  │ /auth      │        │  rooms/roles  │  │
                         │  │ /api/...   │        │               │  │
                         │  └────────────┘        └───────────────┘  │
-                        └──────────────────────────────────────────┘
-                                       ▲                  │
-                                       │ control_message  ▼ broadcast_from_a
-                        ┌──────────────────────────────────────────┐
-                        │   Dashboard / Mobile app (role "authorized")│
-                        └──────────────────────────────────────────┘
+                        └───────────────────────────────────────────┘
+                                   ▲                     │
+                                   │             broadcast_from_a
+                             control_message             │
+                                   │                     ▼
+                       ┌──────────────────────────────────────────────┐
+                       │  Dashboard / Mobile app (role "authorized")  │
+                       └──────────────────────────────────────────────┘
 ```
 
 The server is composed of two cooperating classes:
@@ -103,8 +107,10 @@ chrserver/
 ├── src/
 │   ├── index.ts            # Entry point: boots Server + WSServer, sets up logger
 │   ├── server.ts           # Express app: middleware, REST routes, error handling
-│   └── sockets/
-│       └── wsserver.ts     # Socket.IO gateway: roles, rooms, message relay
+│   ├── sockets/
+│   │    └── wsserver.ts   
+│   └── models/
+│       └── apple          # models will here
 ├── package.json
 ├── tsconfig.json
 └── .gitignore
