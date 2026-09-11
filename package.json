@@ -11,7 +11,8 @@
     "@types/express": "^5.0.6",
     "express": "^5.2.1",
     "logger": "^0.0.1",
-    "pino": "^10.3.1"
+    "pino": "^10.3.1",
+    "socket.io": "^4.8.3"
   },
   "devDependencies": {
     "pino-pretty": "^13.1.3",

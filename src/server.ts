@@ -2,13 +2,13 @@ import express, { Response, Request, Express, NextFunction } from 'express';
 import { logger } from "./index";
 
 export interface ServerConfig {
-    port: string | number;
+    port:  number;
     domain: string;
 }
 
 export class Server {
     app: Express;
-    port: string | number;
+    public port:  number;
     domain: string;
 
     constructor({ port, domain }: ServerConfig) {
