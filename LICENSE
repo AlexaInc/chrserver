@@ -1,0 +1,65 @@
+PROPRIETARY LICENSE — ALL RIGHTS RESERVED
+
+© 2026 Group 01 (SLIIT IT Late Intake July, Kurunegala). All rights reserved.
+
+Project: chrserver — Crop Health Robot Server
+Part of: AI Smart Crop Health Monitoring Robot
+Module: IT1140 — Fundamentals of Computing, SLIIT
+
+------------------------------------------------------------------------------
+1. OWNERSHIP
+------------------------------------------------------------------------------
+This project — including but not limited to its concept, idea, design,
+architecture, source code, documentation, and all associated materials — is the
+original work and exclusive intellectual property of Group 01 (the "Authors").
+
+This software is NOT open source. It is NOT released under any permissive or
+open-source license (including, without limitation, the MIT, Apache, BSD, or
+GPL licenses).
+
+------------------------------------------------------------------------------
+2. PERMITTED USE
+------------------------------------------------------------------------------
+You MAY:
+
+  (a) View and inspect the source code and system architecture for EDUCATIONAL
+      and REFERENCE purposes ONLY.
+
+------------------------------------------------------------------------------
+3. PROHIBITED USE
+------------------------------------------------------------------------------
+You MAY NOT, without the prior written permission of the Authors:
+
+  (a) Use, copy, reuse, redistribute, publish, sublicense, sell, or otherwise
+      exploit this project or any part of it for COMMERCIAL use.
+
+  (b) Use this project or any part of it for ANY purpose other than educational
+      inspection of the code and architecture.
+
+  (c) Reproduce, adapt, modify, translate, or build upon the underlying IDEA or
+      CONCEPT of this project. The idea is not open to everyone and remains the
+      exclusive property of the Authors.
+
+  (d) Claim, submit, present, or represent this work (or the idea behind it) as
+      your own, in whole or in part.
+
+  (e) Remove, alter, or obscure this license or any copyright notice.
+
+------------------------------------------------------------------------------
+4. PERMISSIONS
+------------------------------------------------------------------------------
+Any use beyond the educational inspection described in Section 2 requires the
+express PRIOR WRITTEN PERMISSION of the Authors.
+
+------------------------------------------------------------------------------
+5. NO WARRANTY
+------------------------------------------------------------------------------
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------------
+All rights not expressly granted herein are reserved by the Authors.

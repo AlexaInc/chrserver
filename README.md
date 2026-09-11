@@ -28,7 +28,7 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
 - [Where This Fits in the Overall System](#where-this-fits-in-the-overall-system)
 - [Known Issues / To Do](#known-issues--to-do)
 - [Team](#team)
-- [License](#license)
+- [License & Usage](#license--usage)
 
 ---
 
@@ -350,7 +350,25 @@ Group 01 — SLIIT, BSc (Hons) in Information Technology (Year 1, Semester 1, 20
 
 ---
 
-## License
+## License & Usage
 
-This project is developed for academic purposes as part of the IT1140 module at SLIIT.
-No license has been specified. Add one (e.g. MIT) if you intend to make it reusable.
+**© 2026 Group 01 (SLIIT IT Late Intake July, Kurunegala). All rights reserved.**
+
+This project — including its concept, idea, design, and source code — is the original work
+and intellectual property of Group 01. It is **not** open source and is **not** released
+under any permissive license (no MIT, Apache, or similar).
+
+**You may:**
+
+- View and inspect the code and **architecture** for **educational and reference purposes only**.
+
+**You may NOT:**
+
+- Use, copy, reuse, or redistribute this project or any part of it for **commercial use**.
+- Use it for **any other purpose** beyond educational inspection.
+- Reproduce, adapt, or build upon the **underlying idea/concept** — the idea is not open to
+  everyone and remains the exclusive property of the authors.
+- Claim, submit, or present this work (or the idea behind it) as your own.
+
+Any use beyond educational inspection of the architecture requires the **prior written
+permission** of the project authors.
