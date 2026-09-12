@@ -3,6 +3,23 @@ import { Express } from "express";
 import http from "http";
 import { logger } from "../index";
 
+
+
+//costom dtatypes(interfacess defin)
+
+export interface RobotMessage<T = any> {
+    Type: string;
+    Message: T;
+}
+export interface RobotMessageContent {
+    moisture: {
+        raw_value: number;
+        moisture_percent: number;
+    };
+    temperature: number;
+    humidity: number;
+}
+//clases
 export class WSServer {
     public io: Server;
     public server: http.Server;
@@ -55,22 +72,34 @@ export class WSServer {
 
     //  msg from esp
     private handleClientA(socket: Socket): void {
-        socket.on('esp_32_message', (data: unknown) => {
+        socket.on('message.upsert', (data: RobotMessage<RobotMessageContent>) => {
+            logger.debug(JSON.stringify(data,null,2));
             logger.info(`Broadcasting message from esp32 (${socket.id})`);
+            switch (data.Type){
+                case "env_info":{
+                    //////handle env info             // bc msg to connected clits
+                                this.io.emit('env_info', {
+                                    sender: socket.id,
+                                    event: data,
+                                });
 
-            // bc msg to connected clits
-            this.io.emit('broadcast_from_a', {
-                sender: socket.id,
-                payload: data,
-            });
+                    break;
+                }
+                case "location":{
+                    logger.debug(JSON.stringify(data,null,2));
+                    //mapprocesorgpsnot created yet
+                    break;
+                }
+            }
+
         });
+
     }
 
     private handleAuthorizedClient(socket: Socket): void {
         socket.on('control_message', (data: unknown) => {
             logger.info(`Control message from ${socket.id} sent to esp32`);
 
-            // Routes message ONLY to sockets inside 'esp32'
             this.io.to('esp_32_room').emit('control_command', {
                 from: socket.id,
                 command: data,
