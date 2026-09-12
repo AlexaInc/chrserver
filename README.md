@@ -344,7 +344,15 @@ This backend is one component of the larger **AI Smart Crop Health Monitoring Ro
 
 ## Team
 
-Group 01 — SLIIT, BSc (Hons) in Information Technology (Year 1, Semester 1, 2026)
+**Group 01 — SLIIT, BSc (Hons) in Information Technology (IT Late Intake July, Kurunegala)**
+
+Maintained and written by **Hansaka (Alexainc)**.
+
+| Role                | Member                                                                                                                    |
+| ------------------- |---------------------------------------------------------------------------------------------------------------------------|
+| 💻 **Development**  | Hansaka [IT26101404]  — [github.com/AlexaInc](https://github.com/AlexaInc) · [github.com/it26101404](https://github.com/it26101404) |
+
+**Full team:**
 
 | IT Number   | Name                    |
 | ----------- | ----------------------- |
