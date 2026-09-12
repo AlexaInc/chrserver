@@ -1,14 +1,7 @@
 import pino, { Logger } from "pino";
-import { createServer } from 'http';
 import { Server } from "./server";
 import { WSServer } from "./sockets/wsserver";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import {
-    loadPlantModel,
-    predictPlant,
-    loadAllPlantModels
-} from "./services/LoadAimodels";
+import { loadAllPlantModels } from "./services/LoadAimodels";
 
 const server = new Server({ port: 8000, domain: '0.0.0.0' });
 
@@ -17,15 +10,17 @@ async function startApp() {
     const routeoptions = {
         "models": models,
     }
-    server
-        .configureMiddleware()
-        .setupRoutes(routeoptions)
-        .configureErrorHandling()
-        .start();
 
-    const wsServer = new WSServer(server.app);
+    server.configureMiddleware();
+    server.setupRoutes(routeoptions);
+    server.configureErrorHandling();
+
+    const httpServer = server.app.listen(Number(server.port), server.domain, (): void => {
+        logger.info(`🚀 Server started successfully at http://${server.domain}:${server.port}`);
+    });
+
+    const wsServer = new WSServer(httpServer);
     wsServer.setup();
-    wsServer.listen(server.port);
 }
 
 startApp();

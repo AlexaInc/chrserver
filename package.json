@@ -9,7 +9,9 @@
   },
   "dependencies": {
     "@tensorflow/tfjs": "^4.22.0",
+    "@types/dotenv": "^6.1.1",
     "@types/express": "^5.0.6",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "logger": "^0.0.1",
     "multer": "^2.3.0",

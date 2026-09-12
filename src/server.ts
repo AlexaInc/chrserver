@@ -2,6 +2,9 @@ import express, { Response, Request, Express, NextFunction } from 'express';
 import { logger } from "./index";
 import multer from 'multer';
 import { Sequential } from '@tensorflow/tfjs';
+import cors from 'cors';
+import {config} from "./config/config";
+import * as crypto from "node:crypto";
 import {
     predictPlant
 } from "./services/LoadAimodels";
@@ -34,22 +37,76 @@ export class Server {
     configureMiddleware(): this {
         // Increased JSON payload limit slightly to accommodate image buffers if passed via JSON
         this.app.use(express.json({ limit: '10mb' }));
+        this.app.use(cors({
+            origin: true,
+            methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+            allowedHeaders: ['Content-Type', 'Authorization'],
+            credentials: true
+        }));
         this.app.use(express.urlencoded({ extended: true }));
         return this;
     }
 
     setupRoutes(options:any ): this {
         this.models = options["models"];
-        this.app.post("/auth/login", (req: Request, res: Response, next: NextFunction):void => {
+        this.app.post("/auth/login", (req: Request, res: Response, next: NextFunction) => {
             try {
                 logger.info("login request");
-                logger.info(req.body);
-                res.status(200).send({ "ok": true });
+
+                const { username, password, nonce } = req.body;
+                if (!username || !password) {
+                    res.status(400).send({
+                        "ok": false,
+                        message: "bad request"
+                    });
+                    return;
+                }
+
+
+                const ADMIN_USERNAME = config.ADMIN_USERNAME;
+                const ADMIN_PASS = config.ADMIN_PASS;
+                const jwt =config.jwt_secret;
+                if (!ADMIN_USERNAME || !ADMIN_PASS) {
+                    res.status(500).send({
+                        "ok": false,
+                        message: "internal server error"
+                    });
+                    return;
+                }
+
+                const adminUserhash = crypto
+                    .createHash('sha256')
+                    .update(String(ADMIN_USERNAME) + String(nonce))
+                    .digest('hex');
+
+                const adminPasshash = crypto
+                    .createHash('sha256')
+                    .update(String(ADMIN_PASS) + String(nonce))
+                    .digest('hex');
+
+                const jwtPasshash = crypto
+                    .createHash('sha256')
+                    .update(String(jwt) + String(nonce))
+                    .digest('hex');
+                if (username !== adminUserhash || password !== adminPasshash) {
+                    res.status(401).send({
+                        "ok": false,
+                        message: "invalid username or password"
+                    });
+                    return;
+                }
+
+                res.status(200).send({
+                    "token": jwtPasshash,
+                    "user": {
+                        "username": "admin",
+                        "role": "Administrator"
+                    }
+                });
             } catch (error) {
                 next(error);
             }
         });
-
         this.app.post(
             "/api/images/upload",
             upload.single('file'),
