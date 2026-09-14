@@ -10,3 +10,6 @@ yarn-error.log*
 **/test.ts
 .vscode/*
 /.env
+/backend-implementation-guide.md
+/wasession/
+/frontend-data-binding-guide.md

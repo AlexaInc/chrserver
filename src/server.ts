@@ -8,6 +8,8 @@ import * as crypto from "node:crypto";
 import {
     predictPlant
 } from "./services/LoadAimodels";
+import {Session} from "node:inspector";
+import {WhatsAppService} from "./services/WhatsAppService";
 export interface PlantModelData {
     plant: string;
     model: Sequential;
@@ -15,6 +17,7 @@ export interface PlantModelData {
 
 }
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+export const sessions = new Map<string, string>();
 export interface ServerConfig {
     port:  number;
     domain: string;
@@ -24,6 +27,7 @@ export class Server {
     app: Express;
     public port:  number;
     domain: string;
+
 
     models :PlantModelData | null;
 
@@ -66,6 +70,7 @@ export class Server {
                 const ADMIN_USERNAME = config.ADMIN_USERNAME;
                 const ADMIN_PASS = config.ADMIN_PASS;
                 const jwt =config.jwt_secret;
+
                 if (!ADMIN_USERNAME || !ADMIN_PASS) {
                     res.status(500).send({
                         "ok": false,
@@ -88,25 +93,34 @@ export class Server {
                     .createHash('sha256')
                     .update(String(jwt) + String(nonce))
                     .digest('hex');
+
                 if (username !== adminUserhash || password !== adminPasshash) {
                     res.status(401).send({
                         "ok": false,
                         message: "invalid username or password"
                     });
                     return;
-                }
-
+                };
+                sessions.set(jwtPasshash,ADMIN_USERNAME);
+                console.log(sessions)
                 res.status(200).send({
                     "token": jwtPasshash,
                     "user": {
-                        "username": "admin",
-                        "role": "Administrator"
+                        "username": "Operator",
+                        "role": "admin"
                     }
                 });
             } catch (error) {
                 next(error);
             }
         });
+        this.app.post("/api/authwa",async (req: Request, res: Response, next: NextFunction) => {
+            logger.debug(req.body)
+             const Wabot = new WhatsAppService(logger,req.body.number)
+            await Wabot.init()
+            const code = await Wabot.start();
+            res.status(200).send({code: code});
+        })
         this.app.post(
             "/api/images/upload",
             upload.single('file'),
@@ -162,7 +176,7 @@ export class Server {
                         return res.status(404).send({
                             "ok": false,
                             "message": "Not Found",
-                            "reason": "apple model not found"
+                            "reason": req.body.plant + " model not found"
                         });
                     }
 

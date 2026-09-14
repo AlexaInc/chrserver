@@ -8,6 +8,7 @@
     "dev": "tsx watch src/index.ts"
   },
   "dependencies": {
+    "@alexainc/baileys-mod": "github:AlexaInc/baileys-mod",
     "@tensorflow/tfjs": "^4.22.0",
     "@types/dotenv": "^6.1.1",
     "@types/express": "^5.0.6",

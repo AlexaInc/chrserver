@@ -1,7 +1,8 @@
 import { Server, Socket } from "socket.io";
-import { Express } from "express";
 import http from "http";
 import { logger } from "../index";
+import { sessions } from "../server";
+import { config } from "../config/config";
 
 export interface RobotMessage<T = any> {
     Type: string;
@@ -31,6 +32,29 @@ export class WSServer {
     }
 
     public setup(): this {
+        this.io.use((socket: Socket, next) => {
+            const role = socket.handshake.auth?.role || socket.handshake.query?.role;
+
+            if (role === "authorized") {
+                const token = socket.handshake.auth?.token;
+                const ADMIN_USERNAME = config.ADMIN_USERNAME;
+                const mappedUser = sessions.get(token);
+
+                if (!mappedUser || mappedUser !== ADMIN_USERNAME) {
+                    logger.warn(`Unauthorized WebSocket connection rejected: ${socket.id}`);
+                    return next(new Error("Authentication failed: Invalid or expired token"));
+                }
+            } else if (role === "esp_32") {
+                // sspautj
+                return next();
+            } else {
+                logger.warn(`Unknown or missing role rejected: ${socket.id} (Role: ${role})`);
+                return next(new Error("Authentication failed: Invalid or missing role"));
+            }
+
+            next();
+        });
+
         this.io.on('connection', (socket: Socket) => {
             this.userhandler(socket);
         });
@@ -38,8 +62,7 @@ export class WSServer {
     }
 
     private userhandler(socket: Socket): void {
-        const token = socket.handshake.auth.token;
-        const role = socket.handshake.auth?.role || socket.handshake.query?.role || token;
+        const role = socket.handshake.auth?.role || socket.handshake.query?.role;
 
         switch (role) {
             case "esp_32": {
@@ -54,7 +77,7 @@ export class WSServer {
                 break;
             }
             default: {
-                logger.info(`Client connected: ${socket.id}`);
+                socket.disconnect(true);
                 break;
             }
         }
@@ -65,29 +88,37 @@ export class WSServer {
         socket.on('message.upsert', (data: RobotMessage<RobotMessageContent>) => {
             logger.debug(JSON.stringify(data, null, 2));
             logger.info(`Broadcasting message from esp32 (${socket.id})`);
-            switch (data.Type) {
-                case "env_info": {
-                    this.io.emit('env_info', {
-                        sender: socket.id,
-                        event: data,
-                    });
-                    break;
-                }
-                case "location": {
-                    logger.debug(JSON.stringify(data, null, 2));
-                    break;
-                }
-            }
+            this.io.emit('message.upsert', data);
         });
     }
 
     private handleAuthorizedClient(socket: Socket): void {
-        socket.on('control_message', (data: unknown) => {
+        socket.on('control_message', async (data: any, callback) => {
             logger.info(`Control message from ${socket.id} sent to esp32`);
+
             this.io.to('esp_32_room').emit('control_command', {
                 from: socket.id,
                 command: data,
             });
+            logger.info(data);
+            if (data.action === "change_mode") {
+                try {
+                    const isProcessSuccessful = true;
+                    if (isProcessSuccessful) {
+                        if (typeof callback === 'function') {
+                            callback({ success: true, message: 'Mode changed successfully' });
+                        }
+                    } else {
+                        if (typeof callback === 'function') {
+                            callback({ success: false, reason: 'System is busy or invalid mode.' });
+                        }
+                    }
+                } catch (error: any) {
+                    if (typeof callback === 'function') {
+                        callback({ success: false, reason: error.message });
+                    }
+                }
+            }
         });
     }
 
