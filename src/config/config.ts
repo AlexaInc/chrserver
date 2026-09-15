@@ -9,6 +9,7 @@ export interface envconfig {
     ADMIN_PASS: string;
     Domain: string;
     tunnelcmd:string;
+    ESP_TOKEN:string;
     DuckdnsToken: string;
     jwt_secret:  string;
 }
@@ -19,6 +20,8 @@ export const config: envconfig = {
     Domain: process.env.Domain||'' ,
     DuckdnsToken: process.env.DuckdnsToken||'' ,
     tunnelcmd:process.env.TUNNEL_CMS||'',
+    ESP_TOKEN:process.env.ESP_TOKEN||'',
     ADMIN_PASS: process.env.ADMIN_PASSWORD || '@dm!nchr',
     jwt_secret: process.env.JWT_SECRET || 'suprsecret1235kr',
 };
+console.log(config)

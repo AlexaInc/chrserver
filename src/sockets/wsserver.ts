@@ -44,8 +44,14 @@ export class WSServer {
                     logger.warn(`Unauthorized WebSocket connection rejected: ${socket.id}`);
                     return next(new Error("Authentication failed: Invalid or expired token"));
                 }
-            } else if (role === "esp_32" || socket.handshake.auth?.token === "esp_32") {
-                // sspautj
+            } else if (role === "esp_32") {
+                const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+                const ESP_TOKEN = config.ESP_TOKEN;
+
+                if (!token || token !== ESP_TOKEN) {
+                    logger.warn(`Unauthorized ESP32 connection rejected: ${socket.id}`);
+                    return next(new Error("Authentication failed: Invalid ESP token"));
+                }
                 return next();
             } else {
                 logger.warn(`Unknown or missing role rejected: ${socket.id} (Role: ${role})`);
@@ -54,7 +60,6 @@ export class WSServer {
 
             next();
         });
-
         this.io.on('connection', (socket: Socket) => {
             this.userhandler(socket);
         });
