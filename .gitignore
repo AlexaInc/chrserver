@@ -9,7 +9,7 @@ yarn-error.log*
 .pnp.js
 **/test.ts
 .vscode/*
-/.env
+/src/config/.env
 /backend-implementation-guide.md
 /wasession/
 /frontend-data-binding-guide.md

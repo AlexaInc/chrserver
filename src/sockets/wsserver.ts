@@ -44,7 +44,7 @@ export class WSServer {
                     logger.warn(`Unauthorized WebSocket connection rejected: ${socket.id}`);
                     return next(new Error("Authentication failed: Invalid or expired token"));
                 }
-            } else if (role === "esp_32") {
+            } else if (role === "esp_32" || socket.handshake.auth?.token === "esp_32") {
                 // sspautj
                 return next();
             } else {

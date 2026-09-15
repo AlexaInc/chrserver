@@ -7,12 +7,18 @@ export interface envconfig {
     port: number;
     ADMIN_USERNAME: string;
     ADMIN_PASS: string;
-    jwt_secret: string;
+    Domain: string;
+    tunnelcmd:string;
+    DuckdnsToken: string;
+    jwt_secret:  string;
 }
 
 export const config: envconfig = {
     port: Number(process.env.PORT) || 8000,
     ADMIN_USERNAME: process.env.ADMIN_USERNAME || 'Administrator',
+    Domain: process.env.Domain||'' ,
+    DuckdnsToken: process.env.DuckdnsToken||'' ,
+    tunnelcmd:process.env.TUNNEL_CMS||'',
     ADMIN_PASS: process.env.ADMIN_PASSWORD || '@dm!nchr',
     jwt_secret: process.env.JWT_SECRET || 'suprsecret1235kr',
 };
