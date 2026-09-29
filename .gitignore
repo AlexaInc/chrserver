@@ -13,3 +13,9 @@ yarn-error.log*
 /backend-implementation-guide.md
 /wasession/
 /frontend-data-binding-guide.md
+
+# Runtime SQLite files
+db/*.db
+db/*.db-*
+dist/
+.env

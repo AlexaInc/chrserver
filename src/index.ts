@@ -6,6 +6,7 @@ import { WhatsAppService } from "./services/WhatsAppService";
 import { startDuckDNSUpdater } from "./services/Duckdns";
 import { exec, ChildProcess } from "child_process";
 import {config} from "./config/config";
+import { CHRDatabase } from "../db/Sqlight";
 const isDev: boolean = process.env.NODE_ENV !== 'production';
 
 export const logger: Logger<never, boolean> = pino({
@@ -22,13 +23,14 @@ export const logger: Logger<never, boolean> = pino({
         : undefined,
 });
 
-const server = new Server({ port: 8000, domain: '0.0.0.0' });
+const server = new Server({ port: config.port, domain: '0.0.0.0' });
 
 async function startApp() {
-    const models = await loadAllPlantModels('src/models');
-    const routeoptions = {
-        "models": models,
-    }
+    const [models, db] = await Promise.all([
+        loadAllPlantModels('src/models'),
+        CHRDatabase.open(),
+    ]);
+    const routeoptions = { models, db };
 
     server.configureMiddleware();
     server.setupRoutes(routeoptions);
@@ -64,7 +66,7 @@ async function startApp() {
         }
     });
 
-     const wsServer = new WSServer(httpServer);
+    const wsServer = new WSServer(httpServer, db);
     wsServer.setup();
 }
 

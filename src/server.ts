@@ -1,250 +1,127 @@
-import express, { Response, Request, Express, NextFunction } from 'express';
-import { logger } from "./index";
-import multer from 'multer';
-import { Sequential } from '@tensorflow/tfjs';
-import cors from 'cors';
-import {config} from "./config/config";
+import express, { Response, Request, Express, NextFunction } from "express";
+import multer from "multer";
+import cors from "cors";
 import * as crypto from "node:crypto";
-import { WSServer } from "./sockets/wsserver";
-import {
-    predictPlant
-} from "./services/LoadAimodels";
-import {Session} from "node:inspector";
-import {WhatsAppService} from "./services/WhatsAppService";
-export interface PlantModelData {
-    plant: string;
-    model: Sequential;
-    classes: string[];
+import { logger } from "./index";
+import { config } from "./config/config";
+import { WSServer, FieldMapMessage, blockAt } from "./sockets/wsserver";
+import { LoadedPlantModel, predictPlant } from "./services/LoadAimodels";
+import { CHRDatabase } from "../db/Sqlight";
 
-}
-export function sendAlertToClients(message: string) {
-    const wsServer = WSServer.getInstance();
-
-    // Emit directly using socket.io instance
-    // Note: If you want to target only the robot room, change .emit to .to('esp_32_room').emit
-    wsServer.io.to("esp_32_room").emit("control_command", {
-        command: { action: message }
-    });
-}
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 export const sessions = new Map<string, string>();
-export interface ServerConfig {
-    port:  number;
-    domain: string;
-}
+
+export interface ServerConfig { port: number; domain: string; }
 
 export class Server {
-    app: Express;
-    public port:  number;
+    app: Express = express();
+    public port: number;
     domain: string;
+    private models: LoadedPlantModel[] = [];
+    private db!: CHRDatabase;
 
-
-    models :PlantModelData | null;
-
-    constructor({ port, domain }: ServerConfig) {
-        this.app = express();
-        this.port = port;
-        this.models = null ;
-        this.domain = domain;
-    }
+    constructor({ port, domain }: ServerConfig) { this.port = port; this.domain = domain; }
 
     configureMiddleware(): this {
-        // Increased JSON payload limit slightly to accommodate image buffers if passed via JSON
-        this.app.use(express.json({ limit: '10mb' }));
-        this.app.use(cors({
-            origin: true,
-            methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-            allowedHeaders: ['Content-Type', 'Authorization'],
-            credentials: true
-        }));
+        this.app.use(express.json({ limit: "10mb" }));
+        this.app.use(cors({ origin: true, methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization", "X-Device-Token"], credentials: true }));
         this.app.use(express.urlencoded({ extended: true }));
         return this;
     }
 
-    setupRoutes(options:any ): this {
-        this.models = options["models"];
-        this.app.post("/auth/login", (req: Request, res: Response, next: NextFunction) => {
+    setupRoutes(options: { models: LoadedPlantModel[]; db: CHRDatabase }): this {
+        this.models = options.models;
+        this.db = options.db;
+
+        this.app.get("/health", (_req, res) => res.send({ ok: true, service: "chrserver", time: Date.now(), models: this.models.map((m) => m.plant) }));
+
+        this.app.post("/auth/login", (req, res) => {
+            const { username, password, nonce } = req.body ?? {};
+            if (!username || !password || !nonce) return res.status(400).send({ ok: false, message: "username, password and nonce are required" });
+            const hash = (value: string) => crypto.createHash("sha256").update(value + String(nonce)).digest("hex");
+            if (username !== hash(config.ADMIN_USERNAME) || password !== hash(config.ADMIN_PASS)) return res.status(401).send({ ok: false, message: "invalid username or password" });
+            const token = hash(config.jwt_secret + crypto.randomBytes(16).toString("hex"));
+            sessions.set(token, config.ADMIN_USERNAME);
+            setTimeout(() => sessions.delete(token), 24 * 60 * 60 * 1000).unref();
+            return res.send({ token, expiresIn: 86400, user: { username: "Operator", role: "admin" } });
+        });
+
+        this.app.get("/api/field-map", this.authorizeClient, async (_req, res, next) => {
+            try { res.send({ ok: true, map: await this.db.getSetting<FieldMapMessage | null>("fieldMap", null) }); } catch (e) { next(e); }
+        });
+        this.app.put("/api/field-map", this.authorizeClient, async (req, res, next) => {
             try {
-                logger.info("login request");
-
-                const { username, password, nonce } = req.body;
-                if (!username || !password) {
-                    res.status(400).send({
-                        "ok": false,
-                        message: "bad request"
-                    });
-                    return;
-                }
-
-
-                const ADMIN_USERNAME = config.ADMIN_USERNAME;
-                const ADMIN_PASS = config.ADMIN_PASS;
-                const jwt =config.jwt_secret;
-
-                if (!ADMIN_USERNAME || !ADMIN_PASS) {
-                    res.status(500).send({
-                        "ok": false,
-                        message: "internal server error"
-                    });
-                    return;
-                }
-
-                const adminUserhash = crypto
-                    .createHash('sha256')
-                    .update(String(ADMIN_USERNAME) + String(nonce))
-                    .digest('hex');
-
-                const adminPasshash = crypto
-                    .createHash('sha256')
-                    .update(String(ADMIN_PASS) + String(nonce))
-                    .digest('hex');
-
-                const jwtPasshash = crypto
-                    .createHash('sha256')
-                    .update(String(jwt) + String(nonce))
-                    .digest('hex');
-
-                if (username !== adminUserhash || password !== adminPasshash) {
-                    res.status(401).send({
-                        "ok": false,
-                        message: "invalid username or password"
-                    });
-                    return;
-                };
-                sessions.set(jwtPasshash,ADMIN_USERNAME);
-                console.log(sessions)
-                res.status(200).send({
-                    "token": jwtPasshash,
-                    "user": {
-                        "username": "Operator",
-                        "role": "admin"
-                    }
-                });
-            } catch (error) {
-                next(error);
-            }
+                await this.db.setSetting("fieldMap", req.body);
+                WSServer.getInstance().io.emit("message.upsert", { Type: "map", Message: req.body });
+                res.send({ ok: true });
+            } catch (e) { next(e); }
         });
-        this.app.post("/api/authwa",async (req: Request, res: Response, next: NextFunction) => {
-            logger.debug(req.body)
-             const Wabot = new WhatsAppService(logger,req.body.number)
-            await Wabot.init()
-            const code = await Wabot.start();
-            res.status(200).send({code: code});
-        })
-        this.app.post("/test", (req: Request, res: Response, next: NextFunction) => {
-            sendAlertToClients("cap_photo");
-            res.status(200).send({})
-        })
-        this.app.post(
-            "/api/images/upload",
-            upload.single('file'),
-            async (req: Request, res: Response, next: NextFunction): Promise<Response<any, Record<string, any>> | undefined> => {
-                try {
-                    logger.debug("upload request");
 
-                    const file = req.file;
-                    logger.debug(req.body.plant)
-                    const otherData = req.body.someTextField;
+        this.app.get("/api/crops", this.authorizeClient, async (_req, res, next) => {
+            try { res.send({ ok: true, crops: await this.db.getCropBatches() }); } catch (e) { next(e); }
+        });
+        this.app.get("/api/reports", this.authorizeClient, async (_req, res, next) => {
+            try { res.send({ ok: true, reports: await this.db.getReports(50) }); } catch (e) { next(e); }
+        });
 
-                    if (!file) {
-                        return res.status(400).send({
-                            "ok": false,
-                            "error": "Bad Request",
-                            "message": "Missing file payload in request body"
-                        });
-                    }
+        this.app.post("/api/images/upload", upload.single("file"), async (req, res, next) => {
+            try {
+                if (!this.isDeviceAuthorized(req)) return res.status(401).send({ ok: false, message: "Invalid device token" });
+                const file = req.file;
+                if (!file) return res.status(400).send({ ok: false, message: "Missing multipart file field 'file'" });
+                if (!["image/jpg", "image/png", "image/jpeg"].includes(file.mimetype)) return res.status(415).send({ ok: false, message: "Only PNG/JPEG images are supported" });
 
-                    const validTypes = ["image/jpg", "image/png", "image/jpeg"];
-                    if (!validTypes.includes(file.mimetype)) {
-                        return res.status(415).send({
-                            "ok": false,
-                            "error": "Unsupported Media Type",
-                            "message": "Invalid file type, only support png or jpg"
-                        });
-                    }
-
-                    if (!file.buffer) {
-                        return res.status(400).send({
-                            "ok": false,
-                            "error": "Bad Request",
-                            "message": "Buffer is empty"
-                        });
-                    }
-                    if (!this.models) {
-                        return res.status(500).send({
-                            "ok": false,
-                            "message": "Internal Server Error",
-                            "reason": "models not loaded yet"
-                        });
-                    }
-                    if(!req.body.plant){
-                        return res.status(400).send({
-                            "ok": false,
-                            "error": "Bad Request",
-                            "reason": "Missing plant name payload in request body"
-                        })
-                    }
-                    const found = (this.models as unknown as PlantModelData[]).find((item) => item.plant === req.body.plant);
-
-                    if (!found) {
-                        return res.status(404).send({
-                            "ok": false,
-                            "message": "Not Found",
-                            "reason": req.body.plant + " model not found"
-                        });
-                    }
-
-
-                    const predictions = await predictPlant(found, file.buffer, 5);
-                    return res.status(200).send({
-                        "ok": true,
-                        "message": "Image uploaded and processed successfully",
-                        "result": predictions
-                    });
-
-                } catch (error) {
-                    next(error);
+                const map = await this.db.getSetting<FieldMapMessage | null>("fieldMap", null);
+                let block = map?.blocks.find((b) => b.id === req.body.blockId) ?? null;
+                const lat = Number(req.body.latitude); const lng = Number(req.body.longitude);
+                if (!block && Number.isFinite(lat) && Number.isFinite(lng)) block = blockAt(map, lat, lng);
+                if (!block) {
+                    const trail = await this.db.getRecentTrail(1);
+                    if (trail[0]) block = blockAt(map, trail[0].latitude, trail[0].longitude);
                 }
-            }
-        );
 
-        this.app.post('/api/robot/command',(req: Request, res: Response, next: NextFunction):void => {
-            logger.info("robot request");
-            logger.info(`${JSON.stringify(req)}`);
-            res.status(200).send({ "ok": true });
-        })
+                // Map is authoritative. Request plant is only a compatibility fallback.
+                const requestedPlant = String(block?.plant || req.body.plant || "").toLowerCase();
+                const aliases: Record<string, string> = { chili: "chilli" };
+                const plant = aliases[requestedPlant] ?? requestedPlant;
+                if (!plant) return res.status(422).send({ ok: false, message: "Robot is not inside a mapped crop block" });
+                const model = this.models.find((m) => m.plant === plant);
+                if (!model) return res.status(404).send({ ok: false, message: `No AI model for ${plant}`, available: this.models.map((m) => m.plant) });
 
+                const predictions = await predictPlant(model, file.buffer, 5);
+                const scan = { plant, blockId: block?.id ?? null, blockName: block?.name ?? null, predictions, capturedAt: Date.now(), deviceId: req.body.deviceId || "robot-01" };
+                WSServer.getInstance().io.to("authorized_room").emit("message.upsert", { Type: "ai_scan", Message: scan });
+                return res.send({ ok: true, message: "Image analyzed", result: predictions, context: { plant, block } });
+            } catch (e) { next(e); }
+        });
+
+        this.app.post("/api/robot/command", this.authorizeClient, (req, res) => {
+            WSServer.getInstance().io.to("esp_32_room").emit("control_command", { command: req.body });
+            res.send({ ok: true });
+        });
+        this.app.post("/api/pump/command", this.authorizeClient, (req, res) => {
+            WSServer.getInstance().io.to("pump_room").emit("control_command", { command: req.body });
+            res.send({ ok: true });
+        });
         return this;
     }
 
-    // Global Error Handling Middleware (must be registered AFTER routes)
+    private authorizeClient = (req: Request, res: Response, next: NextFunction): void => {
+        const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+        if (sessions.get(token) !== config.ADMIN_USERNAME) { res.status(401).send({ ok: false, message: "Unauthorized" }); return; }
+        next();
+    };
+
+    private isDeviceAuthorized(req: Request): boolean {
+        const token = String(req.headers["x-device-token"] || req.body?.token || "");
+        return Boolean(config.ESP_TOKEN) && token === config.ESP_TOKEN;
+    }
+
     configureErrorHandling(): this {
-        this.app.use((err: Error, req: Request, res: Response, next: NextFunction):void => {
-            // Fix: Combine message and stack trace into a single string for the logger
-            logger.error(`Unhandled error: ${err.message} \nStack: ${err.stack}`);
-
-            res.status(500).send({
-                "ok": false,
-                "error": "Internal Server Error",
-                "message": process.env.NODE_ENV === 'production'
-                    ? "An unexpected error occurred"
-                    : err.message
-            });
+        this.app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+            logger.error({ err }, "Unhandled request error");
+            res.status(500).send({ ok: false, error: "Internal Server Error", message: process.env.NODE_ENV === "production" ? "An unexpected error occurred" : err.message });
         });
         return this;
-    }
-    start(): void {
-
-        const server= this.app.listen(Number(this.port), this.domain, ():void => {
-            logger.info(`🚀 Server started successfully at http://${this.domain}:${this.port}`);
-        });
-
-        // Handle server startup errors (e.g., Port already in use)
-        server.on('error', (error: NodeJS.ErrnoException) => {
-            logger.error(`Server startup error: ${error.message}`);
-            if (error.code === 'EADDRINUSE') {
-                logger.error(`Port ${this.port} is already in use. Please use a different port.`);
-            }
-        });
     }
 }
