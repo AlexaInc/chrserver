@@ -4,11 +4,15 @@ import { logger } from "../index";
 import { sessions } from "../server";
 import { config } from "../config/config";
 import { CHRDatabase } from "../../db/Sqlight";
+import { planMission, AutonomousMission } from "../services/MissionPlanner";
 
 export interface RobotMessage<T = any> { Type: string; Message: T; }
 export interface FieldBlock {
     id: string; name: string; plant: string; aiModel?: string; color?: string;
     polygon: [number, number][];
+    rowSpacingM?: number;
+    scanSpacingM?: number;
+    headingDeg?: number;
 }
 export interface FieldMapMessage { name: string; boundary: [number, number][]; blocks: FieldBlock[]; }
 
@@ -125,6 +129,19 @@ export class WSServer {
                     });
                 } else if (data.Type === "ultrasonic") {
                     await this.db.saveUltrasonic(message.distances_cm ?? []);
+                } else if (data.Type === "mission_complete") {
+                    const active = await this.db.getSetting<AutonomousMission | null>("activeMission", null);
+                    if (active && active.missionId === message.missionId) {
+                        await this.db.completePatrol(active.patrolId);
+                        const report = await this.db.buildMissionReport(active.missionId, active.patrolId);
+                        const reportId = await this.db.saveAnalysisReport(
+                            active.patrolId, "auto",
+                            `Mission ${active.missionId} completed with ${(report as any).imageCount} analyzed images`, report);
+                        await this.db.setSetting("activeMission", null);
+                        this.io.to("authorized_room").emit("message.upsert", {
+                            Type: "report", Message: { id: reportId, missionId: active.missionId, report }
+                        });
+                    }
                 }
 
                 this.io.to("authorized_room").emit("message.upsert", envelope);
@@ -156,6 +173,28 @@ export class WSServer {
                 if (data.action === "register_crop_batch") {
                     const id = await this.db.registerCropBatch(data.data);
                     return ack({ success: true, message: "Crop batch registered", data: { id } });
+                }
+                if (data.action === "deploy_mission") {
+                    const online = (await this.io.in("esp_32_room").fetchSockets()).length > 0;
+                    if (!online) return ack({ success: false, reason: "Robot offline" });
+                    const map = await this.db.getSetting<FieldMapMessage | null>("fieldMap", null);
+                    if (!map) return ack({ success: false, reason: "Create and save a field map first" });
+                    const blockIds = Array.isArray(data.data?.blocks) && data.data.blocks.length
+                        ? data.data.blocks : map.blocks.map((b) => b.id);
+                    const patrolId = await this.db.startPatrol(`Mission blocks: ${blockIds.join(",")}`);
+                    const mission = planMission(map, blockIds, data.data ?? {}, patrolId);
+                    if (mission.waypoints.length > 512) {
+                        await this.db.completePatrol(patrolId);
+                        return ack({ success: false, reason: `Route has ${mission.waypoints.length} waypoints; increase row/photo spacing (device maximum: 512)` });
+                    }
+                    await this.db.setSetting("activeMission", mission);
+                    this.io.to("esp_32_room").emit("control_command", {
+                        from: socket.id, command: { action: "autonomous_mission", data: mission, timestamp: Date.now() }
+                    });
+                    this.io.to("authorized_room").emit("message.upsert", {
+                        Type: "mission", Message: { ...mission, state: "deployed", currentWaypoint: 0 }
+                    });
+                    return ack({ success: true, message: `Mission deployed: ${mission.waypoints.length} waypoints`, data: mission });
                 }
                 if (data.action === "start_patrol") await this.db.startPatrol("Started from client");
 

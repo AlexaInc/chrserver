@@ -2,6 +2,8 @@ import express, { Response, Request, Express, NextFunction } from "express";
 import multer from "multer";
 import cors from "cors";
 import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
+import path from "node:path";
 import { logger } from "./index";
 import { config } from "./config/config";
 import { WSServer, FieldMapMessage, blockAt } from "./sockets/wsserver";
@@ -72,7 +74,16 @@ export class Server {
                 if (!["image/jpg", "image/png", "image/jpeg"].includes(file.mimetype)) return res.status(415).send({ ok: false, message: "Only PNG/JPEG images are supported" });
 
                 const map = await this.db.getSetting<FieldMapMessage | null>("fieldMap", null);
-                let block = map?.blocks.find((b) => b.id === req.body.blockId) ?? null;
+                const activeMission = await this.db.getSetting<any>("activeMission", null);
+                const missionId = String(req.body.missionId || activeMission?.missionId || "manual");
+                const patrolId = Number(req.body.patrolId || activeMission?.patrolId || 0);
+                const scanPoint = Number(req.body.scanPoint || 0);
+                const side = ["left", "right", "manual"].includes(req.body.side) ? req.body.side : "manual";
+                const missionWaypoint = activeMission?.missionId === missionId
+                    ? activeMission.waypoints?.find((w: any) => Number(w.index) === scanPoint) : null;
+                // Mission metadata is authoritative at autonomous scan stops, then explicit block/GPS fallbacks.
+                let block = map?.blocks.find((b) => b.id === missionWaypoint?.blockId) ??
+                    map?.blocks.find((b) => b.id === req.body.blockId) ?? null;
                 const lat = Number(req.body.latitude); const lng = Number(req.body.longitude);
                 if (!block && Number.isFinite(lat) && Number.isFinite(lng)) block = blockAt(map, lat, lng);
                 if (!block) {
@@ -89,9 +100,20 @@ export class Server {
                 if (!model) return res.status(404).send({ ok: false, message: `No AI model for ${plant}`, available: this.models.map((m) => m.plant) });
 
                 const predictions = await predictPlant(model, file.buffer, 5);
-                const scan = { plant, blockId: block?.id ?? null, blockName: block?.name ?? null, predictions, capturedAt: Date.now(), deviceId: req.body.deviceId || "robot-01" };
+                const uploadDir = path.resolve(process.env.UPLOAD_DIR || "data/uploads", missionId);
+                await fs.mkdir(uploadDir, { recursive: true });
+                const safeBlock = String(block?.id || "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
+                const imagePath = path.join(uploadDir, `${safeBlock}-${scanPoint}-${side}-${Date.now()}.jpg`);
+                await fs.writeFile(imagePath, file.buffer);
+                if (patrolId > 0 && block?.id) {
+                    await this.db.saveImageScan({ patrolId, missionId, blockId: block.id, plant,
+                        scanPoint, side, imagePath, predictions });
+                }
+                const scan = { plant, blockId: block?.id ?? null, blockName: block?.name ?? null,
+                    missionId, patrolId, scanPoint, side, imagePath, predictions,
+                    capturedAt: Date.now(), deviceId: req.body.deviceId || "robot-01" };
                 WSServer.getInstance().io.to("authorized_room").emit("message.upsert", { Type: "ai_scan", Message: scan });
-                return res.send({ ok: true, message: "Image analyzed", result: predictions, context: { plant, block } });
+                return res.send({ ok: true, message: "Image analyzed", result: predictions, context: { plant, block, missionId, scanPoint, side } });
             } catch (e) { next(e); }
         });
 

@@ -83,8 +83,21 @@ export interface CropBatchRow {
     id: number;
     crop: string;
     block: string | null;
-    planted_at: string | null;     // ISO date
+    planted_at: string | null;
     notes: string | null;
+    created_at: number;
+}
+
+export interface ImageScanRow {
+    id: number;
+    patrol_id: number;
+    mission_id: string;
+    block_id: string;
+    plant: string;
+    scan_point: number;
+    side: string;
+    image_path: string;
+    predictions: string;
     created_at: number;
 }
 
@@ -174,6 +187,21 @@ export class CHRDatabase {
                 notes      TEXT,
                 created_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS image_scans (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                patrol_id   INTEGER NOT NULL REFERENCES patrols(id) ON DELETE CASCADE,
+                mission_id  TEXT NOT NULL,
+                block_id    TEXT NOT NULL,
+                plant       TEXT NOT NULL,
+                scan_point  INTEGER NOT NULL,
+                side        TEXT NOT NULL,
+                image_path  TEXT NOT NULL,
+                predictions TEXT NOT NULL,
+                created_at  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_scan_mission ON image_scans(mission_id);
+            CREATE INDEX IF NOT EXISTS idx_scan_patrol ON image_scans(patrol_id);
         `);
         return new CHRDatabase(db);
     }
@@ -347,6 +375,39 @@ export class CHRDatabase {
     public getCropBatches(): Promise<CropBatchRow[]> {
         return this.db.all<CropBatchRow[]>(
             `SELECT * FROM crop_batches ORDER BY created_at DESC`);
+    }
+
+    public async saveImageScan(scan: {
+        patrolId: number; missionId: string; blockId: string; plant: string;
+        scanPoint: number; side: string; imagePath: string;
+        predictions: Array<{ className: string; confidence: number }>;
+    }): Promise<number> {
+        const r = await this.db.run(
+            `INSERT INTO image_scans
+             (patrol_id, mission_id, block_id, plant, scan_point, side, image_path, predictions, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?)`,
+            scan.patrolId, scan.missionId, scan.blockId, scan.plant, scan.scanPoint,
+            scan.side, scan.imagePath, JSON.stringify(scan.predictions), now());
+        return r.lastID as number;
+    }
+
+    public async getMissionScans(missionId: string): Promise<Array<Omit<ImageScanRow, "predictions"> & { predictions: Array<{className:string; confidence:number}> }>> {
+        const rows = await this.db.all<ImageScanRow[]>(
+            `SELECT * FROM image_scans WHERE mission_id=? ORDER BY scan_point, side`, missionId);
+        return rows.map((r) => ({ ...r, predictions: JSON.parse(r.predictions) }));
+    }
+
+    public async buildMissionReport(missionId: string, patrolId: number): Promise<object> {
+        const scans = await this.getMissionScans(missionId);
+        const sums = new Map<string, { sum: number; count: number }>();
+        for (const scan of scans) for (const p of scan.predictions) {
+            const v = sums.get(p.className) ?? { sum: 0, count: 0 };
+            v.sum += Number(p.confidence) || 0; v.count++; sums.set(p.className, v);
+        }
+        const averages = [...sums].map(([className, v]) => ({ className, averageConfidence: v.sum / v.count, samples: v.count }))
+            .sort((a, b) => b.averageConfidence - a.averageConfidence);
+        const blocks = [...new Set(scans.map((s) => s.block_id))];
+        return { missionId, patrolId, imageCount: scans.length, blocks, averages, scans, completedAt: now() };
     }
 
     /* ================================================================ */
