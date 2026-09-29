@@ -9,7 +9,8 @@ export interface EnvConfig {
     ADMIN_PASS: string;
     Domain: string;
     tunnelcmd: string;
-    ESP_TOKEN: string;
+    ROBOT_TOKEN: string;
+    PUMP_TOKEN: string;
     DuckdnsToken: string;
     jwt_secret: string;
 }
@@ -21,6 +22,7 @@ export const config: EnvConfig = {
     Domain: process.env.DOMAIN || "",
     DuckdnsToken: process.env.DUCKDNS_TOKEN || "",
     tunnelcmd: process.env.TUNNEL_CMD || "",
-    ESP_TOKEN: process.env.ESP_TOKEN || "change-this-device-token",
+    ROBOT_TOKEN: process.env.ROBOT_TOKEN || "change-this-robot-token",
+    PUMP_TOKEN: process.env.PUMP_TOKEN || "change-this-pump-token",
     jwt_secret: process.env.JWT_SECRET || "change-this-session-secret",
 };

@@ -45,8 +45,12 @@ export class WSServer {
                 if (sessions.get(token) !== config.ADMIN_USERNAME) return next(new Error("Authentication failed"));
                 return next();
             }
-            if (role === "esp_32" || role === "esp_c3_pump") {
-                if (!token || token !== config.ESP_TOKEN) return next(new Error("Invalid device token"));
+            if (role === "esp_32") {
+                if (!token || token !== config.ROBOT_TOKEN) return next(new Error("Invalid robot token"));
+                return next();
+            }
+            if (role === "esp_c3_pump") {
+                if (!token || token !== config.PUMP_TOKEN) return next(new Error("Invalid pump token"));
                 return next();
             }
             return next(new Error("Invalid or missing role"));

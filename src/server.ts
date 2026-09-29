@@ -114,7 +114,7 @@ export class Server {
 
     private isDeviceAuthorized(req: Request): boolean {
         const token = String(req.headers["x-device-token"] || req.body?.token || "");
-        return Boolean(config.ESP_TOKEN) && token === config.ESP_TOKEN;
+        return Boolean(config.ROBOT_TOKEN) && token === config.ROBOT_TOKEN;
     }
 
     configureErrorHandling(): this {

@@ -170,6 +170,8 @@ Configuration is currently minimal and read from environment variables:
 | ------------ | ------- | ------------------------------------------------------------------ |
 | `NODE_ENV`   | —       | Set to `production` to disable pretty logs and hide error details. |
 | `LOG_LEVEL`  | `info`  | pino log level (`trace`, `debug`, `info`, `warn`, `error`, ...).   |
+| `ROBOT_TOKEN` | — | Dedicated credential for `esp_32` robot devices and image uploads. |
+| `PUMP_TOKEN` | — | Different credential for `esp_c3_pump` irrigation controllers. |
 
 > The listening port (`8000`) and host (`0.0.0.0`) are set in `src/index.ts`. To change
 > them, edit the `new Server({ port, domain })` call. Moving these to environment
