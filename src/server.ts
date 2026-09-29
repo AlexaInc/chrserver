@@ -5,6 +5,7 @@ import { Sequential } from '@tensorflow/tfjs';
 import cors from 'cors';
 import {config} from "./config/config";
 import * as crypto from "node:crypto";
+import { WSServer } from "./sockets/wsserver";
 import {
     predictPlant
 } from "./services/LoadAimodels";
@@ -15,6 +16,15 @@ export interface PlantModelData {
     model: Sequential;
     classes: string[];
 
+}
+export function sendAlertToClients(message: string) {
+    const wsServer = WSServer.getInstance();
+
+    // Emit directly using socket.io instance
+    // Note: If you want to target only the robot room, change .emit to .to('esp_32_room').emit
+    wsServer.io.to("esp_32_room").emit("control_command", {
+        command: { action: message }
+    });
 }
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 export const sessions = new Map<string, string>();
@@ -120,6 +130,10 @@ export class Server {
             await Wabot.init()
             const code = await Wabot.start();
             res.status(200).send({code: code});
+        })
+        this.app.post("/test", (req: Request, res: Response, next: NextFunction) => {
+            sendAlertToClients("cap_photo");
+            res.status(200).send({})
         })
         this.app.post(
             "/api/images/upload",

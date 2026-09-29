@@ -64,7 +64,7 @@ async function startApp() {
         }
     });
 
-    const wsServer = new WSServer(httpServer);
+     const wsServer = new WSServer(httpServer);
     wsServer.setup();
 }
 

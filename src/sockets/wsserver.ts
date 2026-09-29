@@ -20,7 +20,9 @@ export interface RobotMessageContent {
 
 export class WSServer {
     public io: Server;
+    private static instance: WSServer;
     constructor(httpServer: http.Server) {
+        WSServer.instance = this
         this.io = new Server(httpServer, {
             cors: {
                 origin: true,
@@ -124,9 +126,15 @@ export class WSServer {
                     }
                 }
             }
+
         });
     }
-
+    public static getInstance(): WSServer {
+        if (!WSServer.instance) {
+            throw new Error("WSServer instance not created yet!");
+        }
+        return WSServer.instance;
+    }
     private handleDisconnect(socket: Socket): void {
         socket.on('disconnect', () => {
             logger.info(`Disconnected ${socket.id}`);
