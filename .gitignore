@@ -19,3 +19,4 @@ db/*.db
 db/*.db-*
 dist/
 .env
+**.patch

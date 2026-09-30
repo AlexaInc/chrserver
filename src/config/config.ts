@@ -1,8 +1,9 @@
 import dotenv from "dotenv";
 import path from "path";
 
-dotenv.config({ path: process.env.ENV_FILE || path.resolve(process.cwd(), ".env") });
-
+dotenv.config({
+    path: process.env.ENV_FILE || path.resolve(__dirname, ".env")
+});
 export interface EnvConfig {
     port: number;
     ADMIN_USERNAME: string;
@@ -26,3 +27,4 @@ export const config: EnvConfig = {
     PUMP_TOKEN: process.env.PUMP_TOKEN || "change-this-pump-token",
     jwt_secret: process.env.JWT_SECRET || "change-this-session-secret",
 };
+console.log(config)
