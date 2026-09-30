@@ -241,7 +241,24 @@ export class Server {
                 const requestedPlant = String(block?.plant || req.body.plant || "").toLowerCase();
                 const aliases: Record<string, string> = { chili: "chilli" };
                 const plant = aliases[requestedPlant] ?? requestedPlant;
-                if (!plant) return res.status(422).send({ ok: false, message: "Robot is not inside a mapped crop block" });
+                if (!plant) {
+                    // Manual capture outside every mapped crop block: never reject the
+                    // operator's photo. Store it and notify clients; AI analysis is
+                    // skipped because no crop model applies to an unmapped location.
+                    if (side === "manual" || missionId === "manual") {
+                        const uploadDir = path.resolve(process.env.UPLOAD_DIR || "data/uploads", missionId);
+                        await fs.mkdir(uploadDir, { recursive: true });
+                        const imagePath = path.join(uploadDir, `unmapped-${scanPoint}-${side}-${Date.now()}.jpg`);
+                        await fs.writeFile(imagePath, file.buffer);
+                        const scan = { plant: "unknown", blockId: null, blockName: null,
+                            missionId, patrolId, scanPoint, side, imagePath, predictions: [],
+                            capturedAt: Date.now(), deviceId: req.body.deviceId || "robot-01" };
+                        WSServer.getInstance().io.to("authorized_room").emit("message.upsert", { Type: "ai_scan", Message: scan });
+                        return res.send({ ok: true, message: "Manual photo stored (outside mapped blocks; AI analysis skipped)",
+                            result: [], context: { plant: null, block: null, missionId, scanPoint, side } });
+                    }
+                    return res.status(422).send({ ok: false, message: "Robot is not inside a mapped crop block" });
+                }
                 const model = this.models.find((m) => m.plant === plant);
                 if (!model) return res.status(404).send({ ok: false, message: `No AI model for ${plant}`, available: this.models.map((m) => m.plant) });
 
