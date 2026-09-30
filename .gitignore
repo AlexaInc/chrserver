@@ -18,5 +18,8 @@ yarn-error.log*
 db/*.db
 db/*.db-*
 dist/
+
+# Runtime-created upload storage (images captured during patrols)
+/data/
 .env
 **.patch

@@ -1,8 +1,15 @@
 import dotenv from "dotenv";
 import path from "path";
 
+// Project root .env (matches .env.example at the repo root, and the README's
+// documented configuration steps). Previously this resolved to src/config/.env,
+// which meant a normal `.env` at the project root was silently ignored and the
+// server always fell back to hardcoded defaults (wrong ADMIN_*/ROBOT_TOKEN/
+// PUMP_TOKEN — a real client/server/hardware wiring bug: the client would log
+// in with the placeholder admin password and devices with placeholder tokens
+// while the "configured" .env was never actually read).
 dotenv.config({
-    path: process.env.ENV_FILE || path.resolve(__dirname, ".env")
+    path: process.env.ENV_FILE || path.resolve(__dirname, "..", "..", ".env")
 });
 export interface EnvConfig {
     port: number;
@@ -27,4 +34,8 @@ export const config: EnvConfig = {
     PUMP_TOKEN: process.env.PUMP_TOKEN || "change-this-pump-token",
     jwt_secret: process.env.JWT_SECRET || "change-this-session-secret",
 };
-console.log(config)
+
+if (process.env.NODE_ENV !== "production") {
+    // Redact secrets — never print tokens/passwords, even in dev logs.
+    console.log({ ...config, ADMIN_PASS: "***", ROBOT_TOKEN: "***", PUMP_TOKEN: "***", jwt_secret: "***" });
+}

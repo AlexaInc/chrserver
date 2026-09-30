@@ -7,16 +7,24 @@
  *  - NO users / sessions tables — single admin from env, tokens in the in-memory Map.
  *  - Data is collected per PATROL (a run). When a patrol completes (or on manual
  *    trigger) the collected rows are analyzed in one batch → an analysis report row.
- *  - Robot sensors: GPS + 4–5 ultrasonic (no lidar).
+ *  - Robot (rover, role "esp_32") sensors that are ACTUALLY wired and trustworthy:
+ *    GPS, DHT22 (temperature/humidity), rain gauge, 3x ultrasonic (front/left/right),
+ *    and the AI camera (photos). The rover also exposes a raw soil-moisture analog
+ *    pin in firmware, but it is NOT a reliable/calibrated reading on this build, so it
+ *    is intentionally never persisted or trusted here — see WSServer.handleDevice().
+ *  - Soil moisture that IS trustworthy comes from the separate ESP32-C3 irrigation
+ *    controller (role "esp_c3_pump"), stored in irrigation_readings.
  *
  * Tables:
- *   patrols            one row per patrol run (running → completed → analyzed)
- *   location_history   GPS fixes, linked to the active patrol
- *   sensor_readings    moisture/temperature/humidity ticks (RobotMessageContent)
- *   ultrasonic_readings distances of the 4–5 ultrasonic sensors per tick (JSON array)
- *   analysis_reports   batch-analysis output per patrol (auto or manual trigger)
- *   settings           key/value store (fleet config, thresholds, anything)
- *   crop_batches       crop data (variety, block, planted date, notes)
+ *   patrols             one row per patrol run (running → completed → analyzed)
+ *   location_history    GPS fixes, linked to the active patrol
+ *   sensor_readings      rover DHT22/rain/ultrasonic ticks
+ *   analysis_reports    batch-analysis output per patrol (auto or manual trigger)
+ *   settings             key/value store (fleet config, thresholds, anything)
+ *   crop_batches        crop data (variety, block, planted date, notes)
+ *   image_scans         one row per uploaded+analyzed photo
+ *   irrigation_readings pump controller ticks (real soil moisture + pump state)
+ *   alerts              server-raised alerts from real, observable conditions
  *
  * Usage:
  *   import { CHRDatabase } from "../../db/Sqlight";
@@ -54,17 +62,15 @@ export interface LocationRow {
 export interface SensorReadingRow {
     id: number;
     patrol_id: number | null;
-    moisture_raw: number | null;
-    moisture_percent: number | null;
     temperature: number | null;
     humidity: number | null;
-    received_at: number;
-}
-
-export interface UltrasonicRow {
-    id: number;
-    patrol_id: number | null;
-    distances_cm: string;          // JSON array e.g. "[120.5, 98.2, 200, 45.1, 300]"
+    rain_percent: number | null;
+    is_raining: number | null;     // 0/1
+    dist_forward_cm: number | null;
+    dist_left_cm: number | null;
+    dist_right_cm: number | null;
+    block_id: string | null;
+    plant: string | null;
     received_at: number;
 }
 
@@ -101,11 +107,40 @@ export interface ImageScanRow {
     created_at: number;
 }
 
-/** Matches wsserver.ts RobotMessageContent */
-export interface SensorMessage {
-    moisture?: { raw_value: number; moisture_percent: number };
+export interface IrrigationReadingRow {
+    id: number;
+    device_id: string;
+    pump_on: number;
+    auto_mode: number;
+    soil_moisture: number | null;
+    threshold: number | null;
+    active_block_id: string | null;
+    received_at: number;
+}
+
+export type AlertSeverity = "info" | "warning" | "critical";
+
+export interface AlertRow {
+    id: number;
+    severity: AlertSeverity;
+    title: string;
+    description: string | null;
+    source: string;                // e.g. "esp_32", "esp_c3_pump", "ai_scan", "system"
+    created_at: number;
+    acknowledged_at: number | null;
+}
+
+/** What the rover ("esp_32") actually reports per tick — Type:"sensors". */
+export interface RoverSensorMessage {
     temperature?: number;
     humidity?: number;
+    rainDrop?: number;
+    isRaining?: boolean;
+    distForward?: number;
+    distLeft?: number;
+    distRight?: number;
+    blockId?: string;
+    plant?: string;
 }
 
 /* ------------------------------------------------------------------ */
@@ -114,6 +149,11 @@ export interface SensorMessage {
 
 const DB_PATH = process.env.CHR_DB_PATH || path.join(__dirname, "chr.db");
 const now = (): number => Date.now();
+
+async function columnExists(db: Database, table: string, column: string): Promise<boolean> {
+    const rows = await db.all<{ name: string }[]>(`PRAGMA table_info(${table})`);
+    return rows.some((r) => r.name === column);
+}
 
 export class CHRDatabase {
     private constructor(private db: Database) {}
@@ -148,21 +188,19 @@ export class CHRDatabase {
             CREATE TABLE IF NOT EXISTS sensor_readings (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 patrol_id        INTEGER REFERENCES patrols(id) ON DELETE SET NULL,
-                moisture_raw     REAL,
-                moisture_percent REAL,
                 temperature      REAL,
                 humidity         REAL,
+                rain_percent     REAL,
+                is_raining       INTEGER,
+                dist_forward_cm  REAL,
+                dist_left_cm     REAL,
+                dist_right_cm    REAL,
+                block_id         TEXT,
+                plant            TEXT,
                 received_at      INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_sensor_patrol ON sensor_readings(patrol_id);
-
-            CREATE TABLE IF NOT EXISTS ultrasonic_readings (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                patrol_id    INTEGER REFERENCES patrols(id) ON DELETE SET NULL,
-                distances_cm TEXT NOT NULL,          -- JSON array, index = sensor number
-                received_at  INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_ultra_patrol ON ultrasonic_readings(patrol_id);
+            CREATE INDEX IF NOT EXISTS idx_sensor_time ON sensor_readings(received_at);
 
             CREATE TABLE IF NOT EXISTS analysis_reports (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,7 +240,48 @@ export class CHRDatabase {
             );
             CREATE INDEX IF NOT EXISTS idx_scan_mission ON image_scans(mission_id);
             CREATE INDEX IF NOT EXISTS idx_scan_patrol ON image_scans(patrol_id);
+
+            CREATE TABLE IF NOT EXISTS irrigation_readings (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id       TEXT NOT NULL,
+                pump_on         INTEGER NOT NULL,
+                auto_mode       INTEGER NOT NULL,
+                soil_moisture   REAL,
+                threshold       REAL,
+                active_block_id TEXT,
+                received_at     INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_irrigation_time ON irrigation_readings(received_at);
+
+            CREATE TABLE IF NOT EXISTS alerts (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                severity        TEXT NOT NULL CHECK (severity IN ('info','warning','critical')),
+                title           TEXT NOT NULL,
+                description     TEXT,
+                source          TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                acknowledged_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_alerts_time ON alerts(created_at);
         `);
+
+        // Migrate older DBs created before rain/ultrasonic columns or the
+        // block_id/plant columns existed on sensor_readings.
+        const migrations: Array<[string, string]> = [
+            ["temperature", "ALTER TABLE sensor_readings ADD COLUMN temperature REAL"],
+            ["humidity", "ALTER TABLE sensor_readings ADD COLUMN humidity REAL"],
+            ["rain_percent", "ALTER TABLE sensor_readings ADD COLUMN rain_percent REAL"],
+            ["is_raining", "ALTER TABLE sensor_readings ADD COLUMN is_raining INTEGER"],
+            ["dist_forward_cm", "ALTER TABLE sensor_readings ADD COLUMN dist_forward_cm REAL"],
+            ["dist_left_cm", "ALTER TABLE sensor_readings ADD COLUMN dist_left_cm REAL"],
+            ["dist_right_cm", "ALTER TABLE sensor_readings ADD COLUMN dist_right_cm REAL"],
+            ["block_id", "ALTER TABLE sensor_readings ADD COLUMN block_id TEXT"],
+            ["plant", "ALTER TABLE sensor_readings ADD COLUMN plant TEXT"],
+        ];
+        for (const [column, sql] of migrations) {
+            if (!(await columnExists(db, "sensor_readings", column))) await db.exec(sql);
+        }
+
         return new CHRDatabase(db);
     }
 
@@ -237,6 +316,11 @@ export class CHRDatabase {
             `SELECT * FROM patrols WHERE status='completed' ORDER BY ended_at DESC LIMIT 1`);
     }
 
+    /** Most recent patrols, newest first (for a simple mission/patrol history view). */
+    public getRecentPatrols(limit = 20): Promise<PatrolRow[]> {
+        return this.db.all<PatrolRow[]>(`SELECT * FROM patrols ORDER BY id DESC LIMIT ?`, limit);
+    }
+
     /* ================================================================ */
     /* Live data ingest — call from wsserver's message.upsert handler    */
     /* ================================================================ */
@@ -253,23 +337,66 @@ export class CHRDatabase {
             m.altitude ?? null, m.satellites ?? null, now());
     }
 
-    /** Type:"sensors" (RobotMessageContent) → moisture/temp/humidity tick. */
-    public async saveSensorReading(m: SensorMessage): Promise<void> {
+    /**
+     * Type:"sensors" (rover DHT22 + rain + ultrasonic tick).
+     * NOTE: the rover firmware also reports a raw `soilMoisture` analog reading, but it
+     * is not a calibrated/trustworthy value on this hardware build — it is intentionally
+     * dropped before it ever reaches this method (see WSServer.handleDevice()).
+     */
+    public async saveSensorReading(m: RoverSensorMessage): Promise<void> {
         const patrol = await this.getActivePatrol();
         await this.db.run(
-            `INSERT INTO sensor_readings (patrol_id, moisture_raw, moisture_percent, temperature, humidity, received_at)
-             VALUES (?,?,?,?,?,?)`,
+            `INSERT INTO sensor_readings
+             (patrol_id, temperature, humidity, rain_percent, is_raining,
+              dist_forward_cm, dist_left_cm, dist_right_cm, block_id, plant, received_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
             patrol?.id ?? null,
-            m.moisture?.raw_value ?? null, m.moisture?.moisture_percent ?? null,
-            m.temperature ?? null, m.humidity ?? null, now());
+            m.temperature ?? null, m.humidity ?? null,
+            m.rainDrop ?? null, m.isRaining == null ? null : (m.isRaining ? 1 : 0),
+            m.distForward ?? null, m.distLeft ?? null, m.distRight ?? null,
+            m.blockId || null, m.plant || null, now());
     }
 
-    /** Type:"ultrasonic" → distances of the 4–5 sensors, e.g. [120.5, 98.2, 200, 45.1]. */
-    public async saveUltrasonic(distancesCm: number[]): Promise<void> {
-        const patrol = await this.getActivePatrol();
+    /** Latest rover sensor tick, or undefined if none yet. */
+    public getLatestSensorReading(): Promise<SensorReadingRow | undefined> {
+        return this.db.get<SensorReadingRow>(
+            `SELECT * FROM sensor_readings ORDER BY received_at DESC LIMIT 1`);
+    }
+
+    /** Sensor history for charts — newest last (chronological). */
+    public async getSensorHistory(sinceMs: number, limit = 500): Promise<SensorReadingRow[]> {
+        const rows = await this.db.all<SensorReadingRow[]>(
+            `SELECT * FROM sensor_readings WHERE received_at >= ? ORDER BY received_at DESC LIMIT ?`,
+            sinceMs, limit);
+        return rows.reverse();
+    }
+
+    /* ================================================================ */
+    /* Irrigation / pump controller (real soil moisture lives here)      */
+    /* ================================================================ */
+
+    public async saveIrrigationReading(m: {
+        deviceId: string; pumpOn: boolean; autoMode: boolean;
+        soilMoisture?: number; threshold?: number; activeBlockId?: string | null;
+    }): Promise<void> {
         await this.db.run(
-            `INSERT INTO ultrasonic_readings (patrol_id, distances_cm, received_at) VALUES (?,?,?)`,
-            patrol?.id ?? null, JSON.stringify(distancesCm), now());
+            `INSERT INTO irrigation_readings
+             (device_id, pump_on, auto_mode, soil_moisture, threshold, active_block_id, received_at)
+             VALUES (?,?,?,?,?,?,?)`,
+            m.deviceId, m.pumpOn ? 1 : 0, m.autoMode ? 1 : 0,
+            m.soilMoisture ?? null, m.threshold ?? null, m.activeBlockId || null, now());
+    }
+
+    public getLatestIrrigationReading(): Promise<IrrigationReadingRow | undefined> {
+        return this.db.get<IrrigationReadingRow>(
+            `SELECT * FROM irrigation_readings ORDER BY received_at DESC LIMIT 1`);
+    }
+
+    public async getIrrigationHistory(sinceMs: number, limit = 500): Promise<IrrigationReadingRow[]> {
+        const rows = await this.db.all<IrrigationReadingRow[]>(
+            `SELECT * FROM irrigation_readings WHERE received_at >= ? ORDER BY received_at DESC LIMIT ?`,
+            sinceMs, limit);
+        return rows.reverse();
     }
 
     /* ================================================================ */
@@ -281,21 +408,15 @@ export class CHRDatabase {
         patrol: PatrolRow | undefined;
         locations: LocationRow[];
         sensors: SensorReadingRow[];
-        ultrasonic: Array<Omit<UltrasonicRow, "distances_cm"> & { distances_cm: number[] }>;
     }> {
-        const [patrol, locations, sensors, ultraRaw] = await Promise.all([
+        const [patrol, locations, sensors] = await Promise.all([
             this.db.get<PatrolRow>(`SELECT * FROM patrols WHERE id=?`, patrolId),
             this.db.all<LocationRow[]>(
                 `SELECT * FROM location_history WHERE patrol_id=? ORDER BY received_at`, patrolId),
             this.db.all<SensorReadingRow[]>(
                 `SELECT * FROM sensor_readings WHERE patrol_id=? ORDER BY received_at`, patrolId),
-            this.db.all<UltrasonicRow[]>(
-                `SELECT * FROM ultrasonic_readings WHERE patrol_id=? ORDER BY received_at`, patrolId),
         ]);
-        return {
-            patrol, locations, sensors,
-            ultrasonic: ultraRaw.map((u) => ({ ...u, distances_cm: JSON.parse(u.distances_cm) as number[] })),
-        };
+        return { patrol, locations, sensors };
     }
 
     /** Save the analysis result and mark the patrol analyzed. Returns report id. */
@@ -315,6 +436,11 @@ export class CHRDatabase {
         const rows = await this.db.all<AnalysisReportRow[]>(
             `SELECT * FROM analysis_reports ORDER BY created_at DESC LIMIT ?`, limit);
         return rows.map((r) => ({ ...r, report: JSON.parse(r.report) as object }));
+    }
+
+    public async getReportById(id: number): Promise<(Omit<AnalysisReportRow, "report"> & { report: any }) | undefined> {
+        const row = await this.db.get<AnalysisReportRow>(`SELECT * FROM analysis_reports WHERE id=?`, id);
+        return row ? { ...row, report: JSON.parse(row.report) } : undefined;
     }
 
     /* ================================================================ */
@@ -397,6 +523,16 @@ export class CHRDatabase {
         return rows.map((r) => ({ ...r, predictions: JSON.parse(r.predictions) }));
     }
 
+    public async getRecentScans(limit = 20): Promise<Array<Omit<ImageScanRow, "predictions"> & { predictions: Array<{className:string; confidence:number}> }>> {
+        const rows = await this.db.all<ImageScanRow[]>(
+            `SELECT * FROM image_scans ORDER BY created_at DESC LIMIT ?`, limit);
+        return rows.map((r) => ({ ...r, predictions: JSON.parse(r.predictions) }));
+    }
+
+    public getScanById(id: number): Promise<ImageScanRow | undefined> {
+        return this.db.get<ImageScanRow>(`SELECT * FROM image_scans WHERE id=?`, id);
+    }
+
     public async buildMissionReport(missionId: string, patrolId: number): Promise<object> {
         const scans = await this.getMissionScans(missionId);
         const sums = new Map<string, { sum: number; count: number }>();
@@ -411,6 +547,52 @@ export class CHRDatabase {
     }
 
     /* ================================================================ */
+    /* Alerts — raised only from real, observable conditions              */
+    /* ================================================================ */
+
+    public async createAlert(a: {
+        severity: AlertSeverity; title: string; description?: string; source: string;
+    }): Promise<AlertRow> {
+        const r = await this.db.run(
+            `INSERT INTO alerts (severity, title, description, source, created_at) VALUES (?,?,?,?,?)`,
+            a.severity, a.title, a.description ?? null, a.source, now());
+        return (await this.db.get<AlertRow>(`SELECT * FROM alerts WHERE id=?`, r.lastID))!;
+    }
+
+    public listAlerts(limit = 50, onlyUnacknowledged = false): Promise<AlertRow[]> {
+        return this.db.all<AlertRow[]>(
+            onlyUnacknowledged
+                ? `SELECT * FROM alerts WHERE acknowledged_at IS NULL ORDER BY created_at DESC LIMIT ?`
+                : `SELECT * FROM alerts ORDER BY created_at DESC LIMIT ?`,
+            limit);
+    }
+
+    public async countUnacknowledgedAlerts(): Promise<number> {
+        const row = await this.db.get<{ n: number }>(
+            `SELECT COUNT(*) as n FROM alerts WHERE acknowledged_at IS NULL`);
+        return row?.n ?? 0;
+    }
+
+    /** The most recent alert of `title`, used to throttle repeat alerts (e.g. rain). */
+    public getLastAlertByTitle(title: string): Promise<AlertRow | undefined> {
+        return this.db.get<AlertRow>(
+            `SELECT * FROM alerts WHERE title=? ORDER BY created_at DESC LIMIT 1`, title);
+    }
+
+    public async acknowledgeAlerts(ids?: number[]): Promise<number> {
+        if (ids && ids.length) {
+            const placeholders = ids.map(() => "?").join(",");
+            const r = await this.db.run(
+                `UPDATE alerts SET acknowledged_at=? WHERE id IN (${placeholders}) AND acknowledged_at IS NULL`,
+                now(), ...ids);
+            return r.changes ?? 0;
+        }
+        const r = await this.db.run(
+            `UPDATE alerts SET acknowledged_at=? WHERE acknowledged_at IS NULL`, now());
+        return r.changes ?? 0;
+    }
+
+    /* ================================================================ */
     /* Housekeeping                                                      */
     /* ================================================================ */
 
@@ -419,7 +601,7 @@ export class CHRDatabase {
         const cutoff = now() - days * 86400000;
         await this.db.run(`DELETE FROM location_history WHERE received_at < ?`, cutoff);
         await this.db.run(`DELETE FROM sensor_readings WHERE received_at < ?`, cutoff);
-        await this.db.run(`DELETE FROM ultrasonic_readings WHERE received_at < ?`, cutoff);
+        await this.db.run(`DELETE FROM irrigation_readings WHERE received_at < ?`, cutoff);
     }
 
     public close(): Promise<void> {

@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger } from "./index";
 import { config } from "./config/config";
-import { WSServer, FieldMapMessage, blockAt } from "./sockets/wsserver";
+import { WSServer, FieldMapMessage, blockAt, FleetConfig, DEFAULT_FLEET_CONFIG } from "./sockets/wsserver";
 import { LoadedPlantModel, predictPlant } from "./services/LoadAimodels";
 import { CHRDatabase } from "../db/Sqlight";
 
@@ -14,6 +14,21 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 export const sessions = new Map<string, string>();
 
 export interface ServerConfig { port: number; domain: string; }
+
+/** A plant class name counts as "healthy" if it contains this word — matches the
+ *  PlantVillage-style class naming used by every model in src/models/*\/classes.json
+ *  (e.g. "Tomato___healthy", "Potato___healthy"). */
+const isHealthyClass = (className: string): boolean => /healthy/i.test(className);
+
+function toCsv(rows: Array<Record<string, unknown>>): string {
+    if (!rows.length) return "";
+    const headers = Object.keys(rows[0]);
+    const esc = (v: unknown) => {
+        const s = v == null ? "" : String(v);
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    return [headers.join(","), ...rows.map((r) => headers.map((h) => esc(r[h])).join(","))].join("\n");
+}
 
 export class Server {
     app: Express = express();
@@ -48,6 +63,10 @@ export class Server {
             return res.send({ token, expiresIn: 86400, user: { username: "Operator", role: "admin" } });
         });
 
+        /* ---------------------------------------------------------------- */
+        /* Field map                                                         */
+        /* ---------------------------------------------------------------- */
+
         this.app.get("/api/field-map", this.authorizeClient, async (_req, res, next) => {
             try { res.send({ ok: true, map: await this.db.getSetting<FieldMapMessage | null>("fieldMap", null) }); } catch (e) { next(e); }
         });
@@ -55,16 +74,143 @@ export class Server {
             try {
                 await this.db.setSetting("fieldMap", req.body);
                 WSServer.getInstance().io.emit("message.upsert", { Type: "map", Message: req.body });
+                WSServer.getInstance().io.to("esp_32_room").emit("control_command", { command: { action: "field_map", data: req.body } });
                 res.send({ ok: true });
             } catch (e) { next(e); }
         });
 
+        /* ---------------------------------------------------------------- */
+        /* Crops                                                             */
+        /* ---------------------------------------------------------------- */
+
         this.app.get("/api/crops", this.authorizeClient, async (_req, res, next) => {
             try { res.send({ ok: true, crops: await this.db.getCropBatches() }); } catch (e) { next(e); }
         });
+        this.app.get("/api/crops/export.csv", this.authorizeClient, async (_req, res, next) => {
+            try {
+                const crops = await this.db.getCropBatches();
+                res.set("Content-Type", "text/csv").set("Content-Disposition", "attachment; filename=crop-batches.csv");
+                res.send(toCsv(crops.map((c) => ({ id: c.id, crop: c.crop, block: c.block ?? "", plantedAt: c.planted_at ?? "", notes: c.notes ?? "", createdAt: new Date(c.created_at).toISOString() }))));
+            } catch (e) { next(e); }
+        });
+
+        /* ---------------------------------------------------------------- */
+        /* Reports (AI image-analysis batch results)                        */
+        /* ---------------------------------------------------------------- */
+
         this.app.get("/api/reports", this.authorizeClient, async (_req, res, next) => {
             try { res.send({ ok: true, reports: await this.db.getReports(50) }); } catch (e) { next(e); }
         });
+        this.app.get("/api/reports/:id/export.csv", this.authorizeClient, async (req, res, next) => {
+            try {
+                const report = await this.db.getReportById(Number(req.params.id));
+                if (!report) return res.status(404).send({ ok: false, message: "Report not found" });
+                const scans: any[] = report.report?.scans ?? [];
+                const rows = scans.map((s) => ({
+                    blockId: s.block_id, plant: s.plant, scanPoint: s.scan_point, side: s.side,
+                    topClass: s.predictions?.[0]?.className ?? "", topConfidence: s.predictions?.[0]?.confidence ?? "",
+                    capturedAt: new Date(s.created_at).toISOString(),
+                }));
+                res.set("Content-Type", "text/csv").set("Content-Disposition", `attachment; filename=report-${report.id}.csv`);
+                res.send(toCsv(rows));
+            } catch (e) { next(e); }
+        });
+        this.app.get("/api/scans/recent", this.authorizeClient, async (req, res, next) => {
+            try { res.send({ ok: true, scans: await this.db.getRecentScans(Number(req.query.limit) || 20) }); } catch (e) { next(e); }
+        });
+        // Serves the actual captured photo for a scan (thumbnails in the
+        // client's Reports/AI Scan screens). Accepts ?token= like the CSV
+        // export routes, since <Image source={{uri}}> can't set headers.
+        this.app.get("/api/scans/:id/image", this.authorizeClient, async (req, res, next) => {
+            try {
+                const scan = await this.db.getScanById(Number(req.params.id));
+                if (!scan) return res.status(404).send({ ok: false, message: "Scan not found" });
+                res.sendFile(path.resolve(scan.image_path));
+            } catch (e) { next(e); }
+        });
+
+        /* ---------------------------------------------------------------- */
+        /* Alerts                                                            */
+        /* ---------------------------------------------------------------- */
+
+        this.app.get("/api/alerts", this.authorizeClient, async (req, res, next) => {
+            try {
+                const onlyUnacknowledged = req.query.unacknowledged === "1";
+                res.send({ ok: true, alerts: await this.db.listAlerts(Number(req.query.limit) || 50, onlyUnacknowledged) });
+            } catch (e) { next(e); }
+        });
+        this.app.post("/api/alerts/ack", this.authorizeClient, async (req, res, next) => {
+            try {
+                const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number) : undefined;
+                const changed = await this.db.acknowledgeAlerts(ids);
+                res.send({ ok: true, changed });
+            } catch (e) { next(e); }
+        });
+
+        /* ---------------------------------------------------------------- */
+        /* Sensor / irrigation history (Analytics screen)                    */
+        /* ---------------------------------------------------------------- */
+
+        this.app.get("/api/sensors/history", this.authorizeClient, async (req, res, next) => {
+            try {
+                const hours = Math.min(24 * 30, Math.max(1, Number(req.query.hours) || 24));
+                res.send({ ok: true, readings: await this.db.getSensorHistory(Date.now() - hours * 3_600_000) });
+            } catch (e) { next(e); }
+        });
+        this.app.get("/api/irrigation/history", this.authorizeClient, async (req, res, next) => {
+            try {
+                const hours = Math.min(24 * 30, Math.max(1, Number(req.query.hours) || 24));
+                res.send({ ok: true, readings: await this.db.getIrrigationHistory(Date.now() - hours * 3_600_000) });
+            } catch (e) { next(e); }
+        });
+
+        /* ---------------------------------------------------------------- */
+        /* Fleet config (Settings screen — only fields the backend/robot use) */
+        /* ---------------------------------------------------------------- */
+
+        this.app.get("/api/config", this.authorizeClient, async (_req, res, next) => {
+            try { res.send({ ok: true, config: await this.db.getSetting<FleetConfig>("fleetConfig", DEFAULT_FLEET_CONFIG) }); } catch (e) { next(e); }
+        });
+
+        /* ---------------------------------------------------------------- */
+        /* One-shot state snapshot — lets the client render real data       */
+        /* immediately on load, before the first live socket message.       */
+        /* ---------------------------------------------------------------- */
+
+        this.app.get("/api/state", this.authorizeClient, async (_req, res, next) => {
+            try {
+                const ws = WSServer.getInstance();
+                const [trail, sensors, irrigation, map, activeMission, fleetConfig, unacknowledgedAlerts, recentAlerts, recentPatrols] = await Promise.all([
+                    this.db.getRecentTrail(1),
+                    this.db.getLatestSensorReading(),
+                    this.db.getLatestIrrigationReading(),
+                    this.db.getSetting<FieldMapMessage | null>("fieldMap", null),
+                    this.db.getSetting<any>("activeMission", null),
+                    this.db.getSetting<FleetConfig>("fleetConfig", DEFAULT_FLEET_CONFIG),
+                    this.db.countUnacknowledgedAlerts(),
+                    this.db.listAlerts(10),
+                    this.db.getRecentPatrols(5),
+                ]);
+                res.send({
+                    ok: true,
+                    location: trail[0] ?? null,
+                    sensors: sensors ?? null,
+                    irrigation: irrigation ?? null,
+                    fieldMap: map,
+                    hasFieldMap: Boolean(map && map.blocks?.length),
+                    activeMission,
+                    fleetConfig,
+                    devices: { robotOnline: ws.isRobotOnline(), pumpOnline: ws.isPumpOnline() },
+                    status: await ws.computeStatus(),
+                    alerts: { unacknowledged: unacknowledgedAlerts, recent: recentAlerts },
+                    recentPatrols,
+                });
+            } catch (e) { next(e); }
+        });
+
+        /* ---------------------------------------------------------------- */
+        /* Image upload — robot's AI camera capture + analysis                */
+        /* ---------------------------------------------------------------- */
 
         this.app.post("/api/images/upload", upload.single("file"), async (req, res, next) => {
             try {
@@ -113,6 +259,22 @@ export class Server {
                     missionId, patrolId, scanPoint, side, imagePath, predictions,
                     capturedAt: Date.now(), deviceId: req.body.deviceId || "robot-01" };
                 WSServer.getInstance().io.to("authorized_room").emit("message.upsert", { Type: "ai_scan", Message: scan });
+
+                // Real, hardware-completable alert: the AI classifier flagged something
+                // other than "healthy" above the configured confidence threshold.
+                const top = predictions[0];
+                if (top && !isHealthyClass(top.className)) {
+                    const fleetConfig = await this.db.getSetting<FleetConfig>("fleetConfig", DEFAULT_FLEET_CONFIG);
+                    if (top.confidence >= fleetConfig.diseaseAlertThreshold) {
+                        await WSServer.getInstance().raiseAlert(
+                            top.confidence >= 0.85 ? "critical" : "warning",
+                            `Possible ${top.className.replace(/_+/g, " ")} detected`,
+                            `${(top.confidence * 100).toFixed(0)}% confidence in ${block?.name ?? "an unmapped block"} (${plant}).`,
+                            "ai_scan", 2 * 60_000,
+                        );
+                    }
+                }
+
                 return res.send({ ok: true, message: "Image analyzed", result: predictions, context: { plant, block, missionId, scanPoint, side } });
             } catch (e) { next(e); }
         });
@@ -129,7 +291,13 @@ export class Server {
     }
 
     private authorizeClient = (req: Request, res: Response, next: NextFunction): void => {
-        const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+        // CSV export links are opened directly by the OS/browser (Linking.openURL,
+        // window.open, a native share sheet, ...) which cannot attach an
+        // Authorization header, so those routes also accept the session token as
+        // a `?token=` query param. Every other route still requires the header.
+        const headerToken = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+        const queryToken = String(req.query.token || "");
+        const token = headerToken || queryToken;
         if (sessions.get(token) !== config.ADMIN_USERNAME) { res.status(401).send({ ok: false, message: "Unauthorized" }); return; }
         next();
     };
