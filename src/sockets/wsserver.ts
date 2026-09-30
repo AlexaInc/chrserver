@@ -82,7 +82,11 @@ export class WSServer {
     private static instance: WSServer;
     private readonly deviceSockets = new Map<string, string>();
     private readonly onlineRoles = new Set<string>(); // "esp_32" | "esp_c3_pump"
-    private robotMode: "autonomous" | "manual" = "autonomous";
+    /** Last operator mode INTENT (change_mode/manual_teleop). Reporting the
+     *  live mode to clients never trusts this flag alone — computeStatus()
+     *  derives the mode from what the rover is verifiably doing, because the
+     *  firmware boots in manual (no mission loaded) regardless of this value. */
+    private robotMode: "autonomous" | "manual" = "manual";
     private lastMission: { missionId?: string; state?: string; currentWaypoint?: number; totalWaypoints?: number; progress?: number; message?: string } = {};
     private readonly alertThrottle = new Map<string, number>();
 
@@ -141,6 +145,21 @@ export class WSServer {
             if (role === "esp_32") {
                 const map = await this.db.getSetting<FieldMapMessage | null>("fieldMap", null);
                 if (map) socket.emit("control_command", { command: { action: "field_map", data: map } });
+                // A (re)booted rover has lost any in-flight mission from RAM. If the
+                // DB still holds one, reload it onto the robot in a PAUSED state:
+                // the dashboard then truthfully shows idle/manual and the operator's
+                // "Resume Patrol" / autonomous-mode buttons genuinely work again.
+                const active = await this.db.getSetting<AutonomousMission | null>("activeMission", null);
+                if (active && this.lastMission.state !== "completed") {
+                    socket.emit("control_command", { command: { action: "autonomous_mission", data: active, timestamp: Date.now() } });
+                    socket.emit("control_command", { command: { action: "pause_patrol" } });
+                    this.lastMission = {
+                        missionId: active.missionId, state: "paused", currentWaypoint: 0,
+                        totalWaypoints: active.waypoints.length, progress: 0,
+                        message: "Mission reloaded after robot restart — paused, resume when ready",
+                    };
+                    this.robotMode = "manual";
+                }
                 await this.broadcastStatus();
             }
         }
@@ -173,11 +192,17 @@ export class WSServer {
         return this.onlineRoles.has("esp_c3_pump");
     }
 
+    /** Mode is DERIVED, mirroring the firmware exactly: the rover is
+     *  "autonomous" only while a mission is loaded and actively running
+     *  (autonomousActive && !autonomousPaused on the ESP32); in every other
+     *  situation — fresh boot, no mission, paused, fault, offline — it is
+     *  driven manually. This keeps every screen consistent and survives
+     *  client re-login and server restarts. */
     public async computeStatus(): Promise<RobotStatus> {
-        if (!this.isRobotOnline()) return { state: "offline", mode: this.robotMode };
+        if (!this.isRobotOnline()) return { state: "offline", mode: "manual" };
         const active = await this.db.getSetting<AutonomousMission | null>("activeMission", null);
         if (this.lastMission.state === "fault") {
-            return { state: "fault", mode: this.robotMode, message: this.lastMission.message, missionId: this.lastMission.missionId };
+            return { state: "fault", mode: "manual", message: this.lastMission.message, missionId: this.lastMission.missionId };
         }
         if (active && this.lastMission.state !== "completed") {
             const running = this.lastMission.state !== "paused";
@@ -191,7 +216,7 @@ export class WSServer {
                 message: this.lastMission.message,
             };
         }
-        return { state: "idle", mode: this.robotMode, message: this.lastMission.message };
+        return { state: "idle", mode: "manual", message: this.lastMission.message };
     }
 
     private async broadcastStatus(): Promise<void> {
@@ -288,6 +313,15 @@ export class WSServer {
                     return;
                 }
 
+                if (data.Type === "camera_fault" && role === "esp_32") {
+                    // The rover's ESP32-CAM did not deliver a frame over UART. Surface
+                    // it as a real alert so the operator learns WHY no photo arrived.
+                    await this.raiseAlert("warning", "Camera capture failed",
+                        String(message.reason || "ESP32-CAM did not answer on the UART link. Check CAM power (5V), TX0/RX0 wiring and that no USB serial monitor is holding the line."),
+                        "esp_32", 30_000);
+                    return;
+                }
+
                 if (data.Type === "mission_progress" || data.Type === "mission_complete") {
                     this.lastMission = {
                         missionId: message.missionId, state: message.state,
@@ -301,6 +335,7 @@ export class WSServer {
                 }
 
                 if (data.Type === "mission_complete") {
+                    this.robotMode = "manual"; // patrol over — the rover is back to manual driving
                     const active = await this.db.getSetting<AutonomousMission | null>("activeMission", null);
                     if (active && active.missionId === message.missionId) {
                         await this.db.completePatrol(active.patrolId);
