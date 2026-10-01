@@ -101,6 +101,73 @@ export class Server {
         this.app.get("/api/reports", this.authorizeClient, async (_req, res, next) => {
             try { res.send({ ok: true, reports: await this.db.getReports(50) }); } catch (e) { next(e); }
         });
+
+        // Photo collections exist independently of analysis reports. Running,
+        // completed, manual and autonomous patrol photos are all visible here.
+        this.app.get("/api/photo-collections", this.authorizeClient, async (_req, res, next) => {
+            try { res.send({ ok: true, collections: await this.db.getPhotoCollections(50) }); } catch (e) { next(e); }
+        });
+        this.app.post("/api/photo-collections/:id/analyze", this.authorizeClient, async (req, res, next) => {
+            try {
+                const patrolId = Number(req.params.id);
+                const scans = await this.db.getPatrolScans(patrolId);
+                if (!scans.length) return res.status(404).send({ ok: false, message: "Collection has no photos" });
+                for (const scan of scans) {
+                    const model = this.models.find((m) => m.plant === scan.plant);
+                    if (!model) continue;
+                    const predictions = await predictPlant(model, await fs.readFile(scan.image_path), 5);
+                    await this.db.updateScanPredictions(scan.id, predictions);
+                }
+                const refreshed = await this.db.getPatrolScans(patrolId);
+                const missionId = refreshed[0]?.mission_id || `manual-${patrolId}`;
+                const report = await this.db.buildMissionReport(missionId, patrolId);
+                const reportId = await this.db.replacePatrolReport(patrolId, "manual",
+                    `Manually analyzed ${refreshed.length} photos`, report);
+                WSServer.getInstance().io.to("authorized_room").emit("message.upsert", {
+                    Type: "report", Message: { id: reportId, missionId, report }
+                });
+                res.send({ ok: true, reportId, report });
+            } catch (e) { next(e); }
+        });
+        this.app.delete("/api/scans/:id", this.authorizeClient, async (req, res, next) => {
+            try {
+                const scan = await this.db.deleteScan(Number(req.params.id));
+                if (!scan) return res.status(404).send({ ok: false, message: "Photo not found" });
+                await fs.unlink(scan.image_path).catch(() => undefined);
+                res.send({ ok: true });
+            } catch (e) { next(e); }
+        });
+        this.app.delete("/api/photo-collections/:id", this.authorizeClient, async (req, res, next) => {
+            try {
+                const paths = await this.db.deletePhotoCollection(Number(req.params.id));
+                await Promise.all(paths.map((file) => fs.unlink(file).catch(() => undefined)));
+                res.send({ ok: true, deletedPhotos: paths.length });
+            } catch (e) { next(e); }
+        });
+        this.app.post("/api/manual-patrol/start", this.authorizeClient, async (req, res, next) => {
+            try {
+                const map = await this.db.getSetting<FieldMapMessage | null>("fieldMap", null);
+                const block = map?.blocks.find((b) => b.id === String(req.body?.blockId));
+                if (!block) return res.status(400).send({ ok: false, message: "Select a valid field block" });
+                const patrolId = await this.db.startPatrol(`Manual patrol: ${block.name}`, "manual", [block.id]);
+                const context = { patrolId, missionId: `manual-${patrolId}`, blockId: block.id,
+                    blockName: block.name, plant: block.plant, startedAt: Date.now() };
+                await this.db.setSetting("manualPatrol", context);
+                res.send({ ok: true, patrol: context });
+            } catch (e) { next(e); }
+        });
+        this.app.post("/api/manual-patrol/end", this.authorizeClient, async (_req, res, next) => {
+            try {
+                const context = await this.db.getSetting<any>("manualPatrol", null);
+                if (!context) return res.status(409).send({ ok: false, message: "No manual patrol is running" });
+                await this.db.completePatrol(context.patrolId);
+                const report = await this.db.buildMissionReport(context.missionId, context.patrolId);
+                const reportId = await this.db.replacePatrolReport(context.patrolId, "auto",
+                    `Manual patrol ${context.blockName} completed with ${(report as any).imageCount} photos`, report);
+                await this.db.setSetting("manualPatrol", null);
+                res.send({ ok: true, reportId, report });
+            } catch (e) { next(e); }
+        });
         this.app.get("/api/reports/:id/export.csv", this.authorizeClient, async (req, res, next) => {
             try {
                 const report = await this.db.getReportById(Number(req.params.id));
@@ -221,14 +288,17 @@ export class Server {
 
                 const map = await this.db.getSetting<FieldMapMessage | null>("fieldMap", null);
                 const activeMission = await this.db.getSetting<any>("activeMission", null);
-                const missionId = String(req.body.missionId || activeMission?.missionId || "manual");
-                const patrolId = Number(req.body.patrolId || activeMission?.patrolId || 0);
+                const manualPatrol = await this.db.getSetting<any>("manualPatrol", null);
                 const scanPoint = Number(req.body.scanPoint || 0);
                 const side = ["left", "right", "manual"].includes(req.body.side) ? req.body.side : "manual";
+                const manualContext = manualPatrol;
+                const missionId = String(manualContext?.missionId || req.body.missionId || activeMission?.missionId || "manual");
+                const patrolId = Number(manualContext?.patrolId || req.body.patrolId || activeMission?.patrolId || 0);
                 const missionWaypoint = activeMission?.missionId === missionId
                     ? activeMission.waypoints?.find((w: any) => Number(w.index) === scanPoint) : null;
                 // Mission metadata is authoritative at autonomous scan stops, then explicit block/GPS fallbacks.
-                let block = map?.blocks.find((b) => b.id === missionWaypoint?.blockId) ??
+                let block = map?.blocks.find((b) => b.id === manualContext?.blockId) ??
+                    map?.blocks.find((b) => b.id === missionWaypoint?.blockId) ??
                     map?.blocks.find((b) => b.id === req.body.blockId) ?? null;
                 const lat = Number(req.body.latitude); const lng = Number(req.body.longitude);
                 if (!block && Number.isFinite(lat) && Number.isFinite(lng)) block = blockAt(map, lat, lng);
@@ -260,9 +330,10 @@ export class Server {
                     return res.status(422).send({ ok: false, message: "Robot is not inside a mapped crop block" });
                 }
                 const model = this.models.find((m) => m.plant === plant);
-                if (!model) return res.status(404).send({ ok: false, message: `No AI model for ${plant}`, available: this.models.map((m) => m.plant) });
-
-                const predictions = await predictPlant(model, file.buffer, 5);
+                // Storage is mandatory even when a model is unavailable. The
+                // collection remains visible and can be analyzed later after
+                // the appropriate model is installed.
+                const predictions = model ? await predictPlant(model, file.buffer, 5) : [];
                 const uploadDir = path.resolve(process.env.UPLOAD_DIR || "data/uploads", missionId);
                 await fs.mkdir(uploadDir, { recursive: true });
                 const safeBlock = String(block?.id || "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -292,7 +363,7 @@ export class Server {
                     }
                 }
 
-                return res.send({ ok: true, message: "Image analyzed", result: predictions, context: { plant, block, missionId, scanPoint, side } });
+                return res.send({ ok: true, message: model ? "Image stored and analyzed" : "Image stored; no matching AI model yet", result: predictions, context: { plant, block, missionId, scanPoint, side } });
             } catch (e) { next(e); }
         });
 

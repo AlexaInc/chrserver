@@ -47,6 +47,8 @@ export interface PatrolRow {
     ended_at: number | null;
     status: PatrolStatus;
     notes: string | null;
+    mode?: "auto" | "manual" | "mapping";
+    block_ids?: string | null;
 }
 
 export interface LocationRow {
@@ -281,6 +283,10 @@ export class CHRDatabase {
         for (const [column, sql] of migrations) {
             if (!(await columnExists(db, "sensor_readings", column))) await db.exec(sql);
         }
+        if (!(await columnExists(db, "patrols", "mode")))
+            await db.exec("ALTER TABLE patrols ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto'");
+        if (!(await columnExists(db, "patrols", "block_ids")))
+            await db.exec("ALTER TABLE patrols ADD COLUMN block_ids TEXT");
 
         return new CHRDatabase(db);
     }
@@ -290,11 +296,12 @@ export class CHRDatabase {
     /* ================================================================ */
 
     /** Start a patrol; returns its id. Any already-running patrol is aborted first. */
-    public async startPatrol(notes?: string): Promise<number> {
+    public async startPatrol(notes?: string, mode: "auto" | "manual" | "mapping" = "auto", blockIds: string[] = []): Promise<number> {
         await this.db.run(
             `UPDATE patrols SET status='aborted', ended_at=? WHERE status='running'`, now());
         const r = await this.db.run(
-            `INSERT INTO patrols (started_at, notes) VALUES (?, ?)`, now(), notes ?? null);
+            `INSERT INTO patrols (started_at, notes, mode, block_ids) VALUES (?,?,?,?)`,
+            now(), notes ?? null, mode, JSON.stringify(blockIds));
         return r.lastID as number;
     }
 
@@ -531,6 +538,58 @@ export class CHRDatabase {
 
     public getScanById(id: number): Promise<ImageScanRow | undefined> {
         return this.db.get<ImageScanRow>(`SELECT * FROM image_scans WHERE id=?`, id);
+    }
+
+    public async getPhotoCollections(limit = 50): Promise<any[]> {
+        const patrols = await this.db.all<any[]>(
+            `SELECT p.*, COUNT(s.id) AS photo_count, MIN(s.created_at) AS first_photo_at,
+                    MAX(s.created_at) AS last_photo_at
+             FROM patrols p LEFT JOIN image_scans s ON s.patrol_id=p.id
+             GROUP BY p.id HAVING photo_count > 0 ORDER BY p.id DESC LIMIT ?`, limit);
+        const out: any[] = [];
+        for (const patrol of patrols) {
+            const scans = await this.getPatrolScans(patrol.id);
+            const report = await this.db.get<AnalysisReportRow>(
+                `SELECT * FROM analysis_reports WHERE patrol_id=? ORDER BY id DESC LIMIT 1`, patrol.id);
+            out.push({ ...patrol, block_ids: patrol.block_ids ? JSON.parse(patrol.block_ids) : [], scans,
+                report: report ? { ...report, report: JSON.parse(report.report) } : null });
+        }
+        return out;
+    }
+
+    public async getPatrolScans(patrolId: number): Promise<Array<Omit<ImageScanRow, "predictions"> & { predictions: Array<{className:string; confidence:number}> }>> {
+        const rows = await this.db.all<ImageScanRow[]>(
+            `SELECT * FROM image_scans WHERE patrol_id=? ORDER BY created_at`, patrolId);
+        return rows.map((r) => ({ ...r, predictions: JSON.parse(r.predictions) }));
+    }
+
+    public async updateScanPredictions(id: number, predictions: Array<{className:string; confidence:number}>): Promise<void> {
+        await this.db.run(`UPDATE image_scans SET predictions=? WHERE id=?`, JSON.stringify(predictions), id);
+    }
+
+    public async replacePatrolReport(patrolId: number, trigger: ReportTrigger, summary: string, reportBody: object): Promise<number> {
+        await this.db.run(`DELETE FROM analysis_reports WHERE patrol_id=?`, patrolId);
+        return this.saveAnalysisReport(patrolId, trigger, summary, reportBody);
+    }
+
+    public async deleteScan(id: number): Promise<ImageScanRow | undefined> {
+        const scan = await this.getScanById(id);
+        if (scan) {
+            await this.db.run(`DELETE FROM image_scans WHERE id=?`, id);
+            // A saved report embeds its scan list. Remove it so deleted photos
+            // and predictions can never remain visible through stale JSON.
+            await this.db.run(`DELETE FROM analysis_reports WHERE patrol_id=?`, scan.patrol_id);
+            await this.db.run(`UPDATE patrols SET status='completed' WHERE id=? AND status='analyzed'`, scan.patrol_id);
+        }
+        return scan;
+    }
+
+    public async deletePhotoCollection(patrolId: number): Promise<string[]> {
+        const scans = await this.db.all<ImageScanRow[]>(`SELECT * FROM image_scans WHERE patrol_id=?`, patrolId);
+        await this.db.run(`DELETE FROM analysis_reports WHERE patrol_id=?`, patrolId);
+        await this.db.run(`DELETE FROM image_scans WHERE patrol_id=?`, patrolId);
+        await this.db.run(`DELETE FROM patrols WHERE id=?`, patrolId);
+        return scans.map((s) => s.image_path);
     }
 
     public async buildMissionReport(missionId: string, patrolId: number): Promise<object> {

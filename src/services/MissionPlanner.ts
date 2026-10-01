@@ -91,5 +91,11 @@ export function planMission(map: FieldMapMessage, blockIds: string[], requested:
     headingDeg: Number.isFinite(requested.headingDeg) ? Number(requested.headingDeg) : undefined,
   };
   const waypoints = selected.flatMap((b) => planBlock(b, config)).map((w, index) => ({ ...w, index }));
+  // The queued blocks are already visited in the operator-selected order.
+  // After the final block, append the mapped base as a non-scan waypoint.
+  if (map.base && Number.isFinite(map.base.latitude) && Number.isFinite(map.base.longitude)) {
+    waypoints.push({ index: waypoints.length, latitude: map.base.latitude, longitude: map.base.longitude,
+      blockId: "__base__", blockName: map.base.name || "Base", plant: "", scan: false, row: -1 });
+  }
   return { missionId: `mission-${Date.now()}`, patrolId, blocks: selected.map((b) => b.id), config, waypoints, createdAt: Date.now() };
 }

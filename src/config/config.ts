@@ -9,7 +9,7 @@ import path from "path";
 // in with the placeholder admin password and devices with placeholder tokens
 // while the "configured" .env was never actually read).
 dotenv.config({
-    path: process.env.ENV_FILE || path.resolve(__dirname, "..", "..", ".env")
+    path: process.env.ENV_FILE || path.resolve(__dirname, ".env")
 });
 export interface EnvConfig {
     port: number;

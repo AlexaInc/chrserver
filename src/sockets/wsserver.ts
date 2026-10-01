@@ -14,7 +14,7 @@ export interface FieldBlock {
     scanSpacingM?: number;
     headingDeg?: number;
 }
-export interface FieldMapMessage { name: string; boundary: [number, number][]; blocks: FieldBlock[]; }
+export interface FieldMapMessage { name: string; boundary: [number, number][]; blocks: FieldBlock[]; base?: { latitude: number; longitude: number; name?: string }; }
 
 /** Persisted default parameters set from the Settings screen — every field here maps
  *  to something the backend/robot can actually act on (no fantasy fields). */
@@ -120,6 +120,43 @@ export class WSServer {
         return this;
     }
 
+    /** Send missions in bounded Socket.IO events. The ESP32 WebSockets
+     *  library rejects frames above 15 KB; a 216-waypoint mission is ~35 KB.
+     *  Chunks of 32 waypoints stay comfortably below that limit. */
+    private emitMissionChunks(
+        emit: (event: string, payload: unknown) => unknown,
+        mission: AutonomousMission,
+        startPaused: boolean,
+        from?: string,
+    ): void {
+        const { waypoints, ...metadata } = mission;
+        emit("control_command", {
+            ...(from ? { from } : {}),
+            command: {
+                action: "autonomous_mission_begin",
+                data: { ...metadata, totalWaypoints: waypoints.length, startPaused },
+                timestamp: Date.now(),
+            },
+        });
+        const chunkSize = 32;
+        for (let offset = 0; offset < waypoints.length; offset += chunkSize) {
+            emit("control_command", {
+                ...(from ? { from } : {}),
+                command: {
+                    action: "autonomous_mission_chunk",
+                    data: { missionId: mission.missionId, offset, waypoints: waypoints.slice(offset, offset + chunkSize) },
+                },
+            });
+        }
+        emit("control_command", {
+            ...(from ? { from } : {}),
+            command: {
+                action: "autonomous_mission_end",
+                data: { missionId: mission.missionId, totalWaypoints: waypoints.length, startPaused },
+            },
+        });
+    }
+
     private async handleConnection(socket: Socket): Promise<void> {
         const role = String(socket.handshake.auth?.role || socket.handshake.query?.role);
         const deviceId = String(socket.handshake.auth?.deviceId || socket.handshake.query?.deviceId ||
@@ -151,7 +188,7 @@ export class WSServer {
                 // "Resume Patrol" / autonomous-mode buttons genuinely work again.
                 const active = await this.db.getSetting<AutonomousMission | null>("activeMission", null);
                 if (active && this.lastMission.state !== "completed") {
-                    socket.emit("control_command", { command: { action: "autonomous_mission", data: active, timestamp: Date.now() } });
+                    this.emitMissionChunks((event, payload) => socket.emit(event, payload), active, true);
                     socket.emit("control_command", { command: { action: "pause_patrol" } });
                     this.lastMission = {
                         missionId: active.missionId, state: "paused", currentWaypoint: 0,
@@ -165,10 +202,13 @@ export class WSServer {
         }
 
         logger.info({ socketId: socket.id, role, deviceId }, "Socket connected");
-        socket.on("disconnect", () => {
+        socket.on("disconnect", (reason) => {
+            logger.warn({ socketId: socket.id, role, deviceId, reason }, "Socket disconnected");
             if (role !== "authorized") {
-                this.deviceSockets.delete(deviceId);
-                this.onlineRoles.delete(role);
+                if (this.deviceSockets.get(deviceId) === socket.id) {
+                    this.deviceSockets.delete(deviceId);
+                    this.onlineRoles.delete(role);
+                }
                 this.io.to("authorized_room").emit("message.upsert", {
                     Type: "device", Message: { deviceId, role, online: false, lastSeen: Date.now() },
                 });
@@ -429,9 +469,12 @@ export class WSServer {
                     await this.db.setSetting("activeMission", mission);
                     this.lastMission = { missionId: mission.missionId, state: "running", currentWaypoint: 0, totalWaypoints: mission.waypoints.length, progress: 0 };
                     this.robotMode = "autonomous";
-                    this.io.to("esp_32_room").emit("control_command", {
-                        from: socket.id, command: { action: "autonomous_mission", data: mission, timestamp: Date.now() }
-                    });
+                    this.emitMissionChunks(
+                        (event, payload) => this.io.to("esp_32_room").emit(event, payload),
+                        mission,
+                        false,
+                        socket.id,
+                    );
                     this.io.to("authorized_room").emit("message.upsert", {
                         Type: "mission", Message: { ...mission, state: "deployed", currentWaypoint: 0 }
                     });
