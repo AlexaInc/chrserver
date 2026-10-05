@@ -144,6 +144,10 @@ export class Server {
                 res.send({ ok: true, deletedPhotos: paths.length });
             } catch (e) { next(e); }
         });
+        this.app.get("/api/manual-patrol", this.authorizeClient, async (_req, res, next) => {
+            try { res.send({ ok: true, patrol: await this.db.getSetting<any>("manualPatrol", null) }); }
+            catch (e) { next(e); }
+        });
         this.app.post("/api/manual-patrol/start", this.authorizeClient, async (req, res, next) => {
             try {
                 const map = await this.db.getSetting<FieldMapMessage | null>("fieldMap", null);

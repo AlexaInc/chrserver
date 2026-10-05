@@ -239,9 +239,64 @@ export class WhatsAppService {
                 const { messages, type } = m;
                 if (!messages?.length) return;
 
-                const msg = messages[0];
-                const jid = msg.key.remoteJid;
+                const msg:WAMessage = messages[0];
+                const jid:String|undefined = msg.key.remoteJid;
                 const p: ParsedMessage = (await this.parseMessage(msg, this.WaSocket)) as ParsedMessage;
+                const text:String = p.text;
+                const firstarg:String = text.trim().split(/\s+/)[0].toLocaleLowerCase();
+                if (p.senderJid == 'status@broadcast' || p.senderJid?.endsWith('@g.us')){
+                    return;
+                }else if (
+                    firstarg.startsWith(".") ||
+                    firstarg.startsWith("/") ||
+                    firstarg.startsWith("\\")
+                ) {
+                    const Ownernb = null; //getfromdb and phase int
+
+                    const command =firstarg.slice(1);
+                    if (p.senderJid != `${Ownernb}+@s.whatsapp.net`){
+                        const interactiveButtons =[{
+                            name: "cta_url",
+                            buttonParamsJson: JSON.stringify({
+                                display_text: `Contact Us 01`,
+                                url: `wa.me/94766045156`,
+                            }),
+                        },{
+                            name: "cta_url",
+                            buttonParamsJson: JSON.stringify({
+                                display_text: `Contact Us 02`,
+                                url: `wa.me/94702267847`,
+                            }),
+                        }];
+                        const interactiveMessage = {
+                            image: {
+                                url: "./assets/img/alexa.jpg",
+                            },
+                            caption: `⚠️ *ACCESS RESTRICTION ALERT*
+
+• *English:* This command is restricted to crop owners only. If you would like to set up your own system, feel free to contact us.
+• *Sinhala:* මේ command එක crop owners ලාට විතරයි use කරන්න පුළුවන්. ඔයාලටත් ඔය වගේ system එකක් setup කරගන්න ඕනේ නම් අපේ WhatsApp එක හරහා contact කරන්න පුළුවන්!`,
+                            footer: "Powered by hazu@AlexaInc.github.io",
+                            interactiveButtons,
+                        };
+                         await this.WaSocket.sendMessage(msg.key.remoteJid!,
+                             interactiveMessage,
+                             {
+                                 quoted: msg,
+                             });
+                         return;
+                    }
+                    switch (command){
+                        case 'telemetry' : case 'tlm':{
+                            // send crop status last monitered
+                            break;
+                        }
+                        case 'rs' : case 'robot':{
+                            //send robot status
+                            break;
+                        }
+                    }
+                }
                 logger.debug(p.senderlid)
             })
         });
