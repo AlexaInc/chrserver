@@ -172,6 +172,17 @@ export interface ParsedMessage {
 
 export type WhatsAppState = "disabled" | "idle" | "pairing" | "connected";
 
+/**
+ * Health of the stored session, so the app can say something more useful than
+ * "not connected":
+ *   active      - connected right now
+ *   inactive    - session on disk, service currently off / starting
+ *   invalid     - was linked but the session is gone (logged out on the phone,
+ *                 wiped by WhatsApp, ...) → needs linking again
+ *   not_linked  - nothing was ever paired
+ */
+export type SessionHealth = "active" | "inactive" | "invalid" | "not_linked";
+
 export interface WhatsAppStatus {
     state: WhatsAppState;
     enabled: boolean;
@@ -179,9 +190,78 @@ export interface WhatsAppStatus {
     linkedNumber: string | null;
     linkedAt: number | null;
     sessionExists: boolean;
+    /** derived session verdict shown as a badge on the Settings card */
+    sessionHealth: SessionHealth;
     pairingCode: string | null;
     meNumber: string | null;
     lastError: string | null;
+}
+
+/** One contextual reply button (label + the command it sends). */
+export interface WhatsAppButton { label: string; id: string; }
+
+export interface PumpButtonInput {
+    pumpOnline: boolean;
+    pumpOn?: boolean | null;
+    autoMode?: boolean | null;
+}
+
+/**
+ * Pump buttons that match what the pump is doing RIGHT NOW — there is no point
+ * offering "PUMP ON" while it is already running, or "PUMP OFF" while it is
+ * off. Pure function so it can be unit tested (see the smoke test).
+ */
+export function pumpButtons(input: PumpButtonInput): WhatsAppButton[] {
+    if (!input.pumpOnline) return [{ label: "🚿 Pump offline — status", id: ".pump_status" }];
+    if (input.pumpOn) {
+        return [
+            { label: "🛑 Pump OFF", id: ".pump_off" },
+            { label: "📈 Pump status", id: ".pump_status" },
+        ];
+    }
+    return [
+        { label: "🚿 Pump ON 60s", id: ".pump_on 60" },
+        input.autoMode ? { label: "♻️ Auto OFF", id: ".pump_auto off" } : { label: "♻️ Auto ON", id: ".pump_auto on" },
+    ];
+}
+
+export interface MissionButtonInput {
+    robotOnline: boolean;
+    state?: "offline" | "patrolling" | "idle" | "fault" | null;
+    hasMission: boolean;
+}
+
+/**
+ * Mission buttons for the current robot state: pause+stop while patrolling,
+ * resume+stop when a loaded mission is paused, deploy when nothing is loaded —
+ * and never a "Start" button while the rover is offline or already driving.
+ */
+export function missionButtons(input: MissionButtonInput): WhatsAppButton[] {
+    if (!input.robotOnline) return [{ label: "📡 Robot offline — status", id: ".status" }];
+    switch (input.state) {
+        case "patrolling":
+            return [
+                { label: "⏸ Pause patrol", id: ".mission_pause" },
+                { label: "🛑 Stop", id: ".stop" },
+            ];
+        case "fault":
+            return [
+                { label: "🛑 Stop", id: ".stop" },
+                { label: "📈 Mission status", id: ".mission_status" },
+            ];
+        case "idle":
+            return input.hasMission
+                ? [
+                    { label: "▶️ Resume patrol", id: ".mission_resume" },
+                    { label: "🛑 Stop", id: ".stop" },
+                ]
+                : [
+                    { label: "🧭 Deploy mission", id: ".mission" },
+                    { label: "📈 Mission status", id: ".mission_status" },
+                ];
+        default:
+            return [{ label: "📊 Status", id: ".status" }];
+    }
 }
 
 /**
@@ -236,17 +316,26 @@ export class WhatsAppService {
 
     public async getStatus(): Promise<WhatsAppStatus> {
         const settings = await this.requireDb().getWhatsAppSettings();
+        const sessionExists = await this.sessionExists();
         return {
             state: this.waState,
             enabled: settings.enabled,
             ownerNumber: settings.ownerNumber,
             linkedNumber: settings.linkedNumber,
             linkedAt: settings.linkedAt,
-            sessionExists: await this.sessionExists(),
+            sessionExists,
+            sessionHealth: this.sessionHealth(sessionExists),
             pairingCode: this.pairingCode,
             meNumber: jidToNumber(this.WaSocket?.user?.id) || null,
             lastError: this.lastError,
         };
+    }
+
+    /** Verdict for the stored session (see SessionHealth). */
+    private sessionHealth(sessionExists: boolean): SessionHealth {
+        if (this.waState === "connected") return "active";
+        if (sessionExists) return "inactive";
+        return this.pairingCode || this.lastError ? "invalid" : "not_linked";
     }
 
     private async sessionExists(): Promise<boolean> {
@@ -504,6 +593,40 @@ export class WhatsAppService {
         return this.getStatus();
     }
 
+    /**
+     * The bot's ON/OFF switch (Settings → WhatsApp Service).
+     *
+     * OFF only stops the socket and flips the persisted `enabled` flag: the
+     * session files stay on disk, so switching back ON reconnects the same
+     * account without pairing again. `unlink()` is the destructive variant.
+     */
+    public async setEnabled(enabled: boolean): Promise<WhatsAppStatus> {
+        const db = this.requireDb();
+
+        if (!enabled) {
+            this.waState = "disabled";
+            this.pairingCode = null;
+            this.lastError = null;
+            if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+            this.closeSocket();                       // end(), NOT logout(): the session survives
+            await db.saveWhatsAppSettings({ enabled: false });
+            this.logger.warn('WhatsApp service switched OFF (session kept on disk).');
+            return this.getStatus();
+        }
+
+        await db.saveWhatsAppSettings({ enabled: true });
+        if (!(await this.sessionExists())) {
+            this.waState = "idle";                    // nothing to resume — the app must link first
+            this.logger.warn('WhatsApp service switched ON but no session exists yet.');
+            return this.getStatus();
+        }
+        if (this.waState !== "connected" && !this.connecting) {
+            await this.init();
+            await this.start();
+        }
+        return this.getStatus();
+    }
+
     /** Only change the owner gate number — never touches the session. */
     public async setOwnerNumber(rawNumber: string): Promise<WhatsAppStatus> {
         const number = normalizeWhatsAppNumber(rawNumber);
@@ -704,16 +827,25 @@ export class WhatsAppService {
     }
 
     /* ---------------------------------------------------------------- */
-    /* Sending helpers (footer is added to EVERY message)                */
+    /* Sending helpers (the footer is a REAL footer on every message)     */
     /* ---------------------------------------------------------------- */
 
+    /** Used only when a client refuses the interactive payload: the footer
+     *  then has to ride along inside the text, because a plain text message
+     *  has no footer field at all. */
     private withFooter(body: string): string {
         return `${body}\n\n${WA_FOOTER}`;
     }
 
-    private async sendText(jid: string, body: string, quoted?: WAMessage): Promise<void> {
+    /** Raw send — content already carries its own footer field. */
+    private async sendRaw(jid: string, content: any, quoted?: WAMessage): Promise<void> {
         if (!this.WaSocket?.user) throw new Error("WhatsApp is not connected");
-        await this.WaSocket.sendMessage(jid, { text: this.withFooter(body) } as any, quoted ? { quoted } : undefined);
+        await this.WaSocket.sendMessage(jid, content, quoted ? { quoted } : undefined);
+    }
+
+    /** Last-resort plain text (footer inline — see withFooter). */
+    private async sendPlainFallback(jid: string, body: string, quoted?: WAMessage): Promise<void> {
+        await this.sendRaw(jid, { text: this.withFooter(body) }, quoted);
     }
 
     private quickReply(displayText: string, id: string): any {
@@ -747,10 +879,88 @@ export class WhatsAppService {
         };
     }
 
+    /** Map label/id pairs onto native quick-reply buttons. */
+    private toQuickReplies(buttons: WhatsAppButton[], max = 3): any[] {
+        return buttons.slice(0, Math.max(1, max)).map((b) => this.quickReply(b.label, b.id));
+    }
+
+    /** Live inputs for the contextual button builders (one DB + ws round trip). */
+    private async actionContext(): Promise<{ pump: PumpButtonInput; mission: MissionButtonInput }> {
+        const ws = this.getWs();
+        const db = this.requireDb();
+        const [irrigation, active] = await Promise.all([
+            db.getLatestIrrigationReading(),
+            db.getSetting<AutonomousMission | null>("activeMission", null),
+        ]);
+        const status = ws ? await ws.computeStatus() : null;
+        return {
+            pump: {
+                pumpOnline: ws?.isPumpOnline() ?? false,
+                pumpOn: irrigation ? irrigation.pump_on === 1 : null,
+                autoMode: irrigation ? irrigation.auto_mode === 1 : null,
+            },
+            mission: {
+                robotOnline: ws?.isRobotOnline() ?? false,
+                state: status?.state ?? null,
+                hasMission: Boolean(active),
+            },
+        };
+    }
+
     /**
-     * Interactive card: text (or image + caption) + native-flow buttons + the
-     * mandatory footer. Falls back to a plain text message if the client
-     * refuses the interactive payload, so a command never dies silently.
+     * The default button row for any reply. It is built from the live state —
+     * the first button is the one pump action that makes sense now, the second
+     * is the one robot action that makes sense now, and a status refresh fills
+     * the last slot. Nothing is ever hardcoded on/off or start/stop, so the
+     * same card is correct while pumping, idling, patrolling or offline.
+     */
+    private async contextButtons(max = 3, extra: WhatsAppButton[] = []): Promise<any[]> {
+        const { pump, mission } = await this.actionContext();
+        const groups: WhatsAppButton[][] = [extra, pumpButtons(pump), missionButtons(mission)];
+        const merged: WhatsAppButton[] = [];
+        for (const group of groups) if (group.length) merged.push(group[0]);
+        if (merged.length < max) merged.push({ label: "📊 Status", id: ".status" });
+        for (const group of groups.slice(1)) if (group.length > 1 && merged.length < max) merged.push(group[1]);
+
+        const seen = new Set<string>();
+        const unique: WhatsAppButton[] = [];
+        for (const button of merged) {
+            if (seen.has(button.id)) continue;
+            seen.add(button.id);
+            unique.push(button);
+        }
+        return this.toQuickReplies(unique, max);
+    }
+
+    /** Pump-focused row (pump card, pump results). */
+    private async pumpRow(max = 3): Promise<any[]> {
+        const { pump } = await this.actionContext();
+        const buttons = [...pumpButtons(pump)];
+        if (!buttons.some((b) => b.id === ".pump_status")) buttons.push({ label: "📈 Pump status", id: ".pump_status" });
+        if (buttons.length < max) buttons.push({ label: "📊 Status", id: ".status" });
+        return this.toQuickReplies(buttons, max);
+    }
+
+    /** Mission-focused row (mission cards) — pause/stop, resume/stop, deploy. */
+    private async missionRow(max = 3, extra: WhatsAppButton[] = []): Promise<any[]> {
+        const { mission } = await this.actionContext();
+        const buttons = [...extra, ...missionButtons(mission)];
+        const seen = new Set<string>();
+        const unique: WhatsAppButton[] = [];
+        for (const button of buttons) {
+            if (seen.has(button.id)) continue;
+            seen.add(button.id);
+            unique.push(button);
+        }
+        return this.toQuickReplies(unique, max);
+    }
+
+    /**
+     * Interactive card: body text + a REAL footer field + native-flow buttons.
+     * Every customer-visible reply goes through here, which is why the footer
+     * never leaks into the message body. Falls back to a plain text message
+     * only if the client refuses the interactive payload, so a command never
+     * dies silently.
      */
     private async sendInteractive(
         jid: string,
@@ -771,12 +981,25 @@ export class WhatsAppService {
         }
 
         try {
-            await this.WaSocket.sendMessage(jid, content, options.quoted ? { quoted: options.quoted } : undefined);
+            await this.sendRaw(jid, content, options.quoted);
         } catch (error) {
             this.logger.warn({ error }, 'Interactive message failed — falling back to plain text');
             const fallback = options.fallbackHint ? `${options.text}\n\n${options.fallbackHint}` : options.text;
-            await this.sendText(jid, fallback, options.quoted);
+            await this.sendPlainFallback(jid, fallback, options.quoted);
         }
+    }
+
+    /**
+     * Shorthand used by the read-only answers (.whoami, .blocks, .reports,
+     * errors, ...): a card whose buttons are picked from the live state, so the
+     * footer is always a footer and every reply offers a relevant next tap.
+     */
+    private async sendText(jid: string, body: string, quoted?: WAMessage, buttons?: any[]): Promise<void> {
+        await this.sendInteractive(jid, {
+            text: body,
+            quoted,
+            buttons: buttons ?? await this.contextButtons(),
+        });
     }
 
     /* ---------------------------------------------------------------- */
@@ -810,7 +1033,8 @@ export class WhatsAppService {
 
         const settings = await this.requireDb().getWhatsAppSettings();
         if (!settings.ownerNumber) {
-            await this.sendText(remoteJid, "⚠️ No owner number is configured yet. Open the *Settings → WhatsApp Service* page in the dashboard and save the owner number (with country code).", msg);
+            await this.sendText(remoteJid, "⚠️ No owner number is configured yet. Open the *Settings → WhatsApp Service* page in the dashboard and save the owner number (with country code).", msg,
+                [this.quickReply("📋 Menu", ".menu")]);
             return;
         }
         if (!(await this.isOwner(p))) {
@@ -866,6 +1090,8 @@ export class WhatsAppService {
                 return this.sendBlocks(jid, quoted);
             case "session": case "link":
                 return this.sendSession(jid, quoted);
+            case "bot": case "service":
+                return this.botCommand(args, jid, quoted);
             case "owner":
                 return this.ownerCommand(args, jid, quoted);
             case "whoami":
@@ -907,17 +1133,18 @@ Owner-only. Tap a button, or type the command.
 • .telemetry • .alerts • .reports • .blocks
 
 *⚙️ Account*
-• .session — WhatsApp link state
+• .bot on|off — start/stop this bot
+• .session — link + session health
 • .owner — owner number
 • .whoami — your WhatsApp ids`;
 
         await this.sendInteractive(jid, {
             text,
             quoted,
+            // Two live buttons (whatever the pump/robot need right now) + the
+            // catalogue, instead of a fixed ON/OFF pair that is wrong half the time.
             buttons: [
-                this.quickReply("📊 Robot status", ".status"),
-                this.quickReply("🚿 Pump ON", ".pump_on 60"),
-                this.quickReply("🛑 Pump OFF", ".pump_off"),
+                ...await this.contextButtons(2),
                 this.listButton("All commands", [
                     {
                         title: "Robot",
@@ -932,8 +1159,8 @@ Owner-only. Tap a button, or type the command.
                     {
                         title: "Irrigation",
                         rows: [
-                            { title: "Pump ON 60s", description: "run the water pump", id: ".pump_on 60" },
-                            { title: "Pump OFF", description: "stop the water pump", id: ".pump_off" },
+                            { title: "Run the pump", description: "on for 60 s (no-op if already running)", id: ".pump" },
+                            { title: "Stop the pump", description: "off, whatever mode it is in", id: ".pump_off" },
                             { title: "Pump status", description: "soil moisture + mode", id: ".pump_status" },
                         ],
                     },
@@ -942,6 +1169,7 @@ Owner-only. Tap a button, or type the command.
                         rows: [
                             { title: "Telemetry", description: "temperature, humidity, rain, GPS", id: ".telemetry" },
                             { title: "Alerts", description: "what the server flagged", id: ".alerts" },
+                            { title: "Bot switch", description: "turn this WhatsApp service on/off", id: ".bot" },
                         ],
                     },
                 ]),
@@ -995,12 +1223,8 @@ Owner-only. Tap a button, or type the command.
             title: "Robot status",
             text: lines.join("\n"),
             quoted,
-            buttons: [
-                this.quickReply("🔄 Refresh", ".status"),
-                this.quickReply("🚿 Pump ON", ".pump_on 60"),
-                this.quickReply("🛑 Pump OFF", ".pump_off"),
-            ],
-            fallbackHint: "Commands: .status • .pump_on 60 • .pump_off • .telemetry",
+            buttons: await this.contextButtons(3, [{ label: "🔄 Refresh", id: ".status" }]),
+            fallbackHint: "Commands: .status • .pump • .mission • .telemetry",
         });
     }
 
@@ -1028,10 +1252,7 @@ Owner-only. Tap a button, or type the command.
             title: "Telemetry",
             text: lines.join("\n\n"),
             quoted,
-            buttons: [
-                this.quickReply("🔄 Refresh", ".telemetry"),
-                this.quickReply("📊 Status", ".status"),
-            ],
+            buttons: await this.contextButtons(3, [{ label: "🔄 Refresh", id: ".telemetry" }]),
             fallbackHint: "Commands: .telemetry • .status • .alerts",
         });
     }
@@ -1043,7 +1264,8 @@ Owner-only. Tap a button, or type the command.
     private async missionCommand(args: string, jid: string, quoted: WAMessage): Promise<void> {
         const [sub = "", ...rest] = args.split(/\s+/).filter(Boolean);
         const ws = this.getWs();
-        if (!ws) return this.sendText(jid, "⚠️ Server socket gateway is not ready yet.", quoted);
+        if (!ws) return this.sendText(jid, "⚠️ Server socket gateway is not ready yet.", quoted,
+            [this.quickReply("🔄 Retry", ".status"), this.quickReply("📋 Menu", ".menu")]);
 
         switch (sub.toLowerCase()) {
             case "": case "menu": case "help": case "deploy": {
@@ -1056,10 +1278,13 @@ Owner-only. Tap a button, or type the command.
                     return this.sendText(jid, "⚠️ No field map is saved yet. Draw the field blocks in the dashboard's *Mapping* screen first, then come back.", quoted);
                 }
                 return this.sendInteractive(jid, {
-                    title: "Deploy a mission",
+                    title: "Mission",
                     text: `🗺 *Field blocks* — pick the block the robot should patrol.\n${map.blocks.map((b) => `• *${b.name}* (${b.plant}) — id \`${b.id}\``).join("\n")}`,
                     quoted,
+                    // Live mission buttons first (pause/stop while driving, resume
+                    // when paused, deploy when idle) + the block picker.
                     buttons: [
+                        ...await this.missionRow(2),
                         this.listButton("Choose a block", [
                             {
                                 title: "Blocks",
@@ -1077,8 +1302,6 @@ Owner-only. Tap a button, or type the command.
                                 ],
                             },
                         ]),
-                        this.quickReply("📈 Mission status", ".mission_status"),
-                        this.quickReply("⏸ Pause", ".mission_pause"),
                     ],
                     fallbackHint: `Type: .mission deploy ${map.blocks[0].id}   (or "all")`,
                 });
@@ -1106,11 +1329,7 @@ Owner-only. Tap a button, or type the command.
                     title: "Mission status",
                     text: lines.join("\n"),
                     quoted,
-                    buttons: [
-                        this.quickReply("▶️ Resume", ".mission_resume"),
-                        this.quickReply("⏸ Pause", ".mission_pause"),
-                        this.quickReply("🛑 Stop", ".stop"),
-                    ],
+                    buttons: await this.missionRow(3, [{ label: "🔄 Refresh", id: ".mission_status" }]),
                     fallbackHint: "Commands: .mission_status • .mission_resume • .mission_pause • .stop",
                 });
             }
@@ -1126,7 +1345,8 @@ Owner-only. Tap a button, or type the command.
 
     private async emergencyStop(jid: string, quoted: WAMessage): Promise<void> {
         const ws = this.getWs();
-        if (!ws) return this.sendText(jid, "⚠️ Server socket gateway is not ready yet.", quoted);
+        if (!ws) return this.sendText(jid, "⚠️ Server socket gateway is not ready yet.", quoted,
+            [this.quickReply("🔄 Retry", ".status"), this.quickReply("📋 Menu", ".menu")]);
         const stopped = await ws.controlRobot("stop", undefined, "whatsapp");
         const paused = await ws.setRobotMode("manual", "whatsapp");
         const ok = stopped.success;
@@ -1142,27 +1362,31 @@ Owner-only. Tap a button, or type the command.
 
     private async robotAction(jid: string, action: string, data: unknown, quoted: WAMessage, successText: string): Promise<void> {
         const ws = this.getWs();
-        if (!ws) return this.sendText(jid, "⚠️ Server socket gateway is not ready yet.", quoted);
+        if (!ws) return this.sendText(jid, "⚠️ Server socket gateway is not ready yet.", quoted,
+            [this.quickReply("🔄 Retry", ".status"), this.quickReply("📋 Menu", ".menu")]);
         const result = await ws.controlRobot(action, data, "whatsapp");
         await this.sendRobotResult(jid, result.success, result.success ? successText : `❌ ${action} failed: ${result.reason}`, quoted);
     }
 
     private async pumpAction(jid: string, action: string, data: unknown, quoted: WAMessage, successText: string): Promise<void> {
         const ws = this.getWs();
-        if (!ws) return this.sendText(jid, "⚠️ Server socket gateway is not ready yet.", quoted);
+        if (!ws) return this.sendText(jid, "⚠️ Server socket gateway is not ready yet.", quoted,
+            [this.quickReply("🔄 Retry", ".status"), this.quickReply("📋 Menu", ".menu")]);
         const result = await ws.controlPump(action, data, "whatsapp");
         await this.sendRobotResult(jid, result.success, result.success ? successText : `❌ ${action} failed: ${result.reason}`, quoted);
     }
 
-    /** Generic result reply — quick replies let the operator undo instantly. */
+    /** Generic result reply — the buttons are rebuilt from the state the command
+     *  just produced, so a "Pump ON" result offers "Pump OFF" (and vice versa)
+     *  without a single hardcoded pair. */
     private async sendRobotResult(jid: string, ok: boolean, text: string, quoted: WAMessage, buttons?: any[]): Promise<void> {
-        const defaultButtons = ok
-            ? [this.quickReply("📊 Status", ".status"), this.quickReply("🛑 Pump OFF", ".pump_off"), this.quickReply("🧭 Mission", ".mission_status")]
+        const defaults = ok
+            ? await this.contextButtons(3)
             : [this.quickReply("📊 Status", ".status"), this.quickReply("📋 Menu", ".menu")];
         await this.sendInteractive(jid, {
             text,
             quoted,
-            buttons: buttons ?? defaultButtons,
+            buttons: buttons ?? defaults,
             fallbackHint: "Commands: .status • .menu",
         });
     }
@@ -1188,8 +1412,7 @@ Owner-only. Tap a button, or type the command.
                     : "🚿 No pump reading stored yet — is the ESP32-C3 controller online?",
                 quoted,
                 buttons: [
-                    this.quickReply("🚿 Pump ON 60s", ".pump_on 60"),
-                    this.quickReply("🛑 Pump OFF", ".pump_off"),
+                    ...await this.pumpRow(2),
                     this.listButton("More", [
                         {
                             title: "Pump control",
@@ -1255,7 +1478,7 @@ Owner-only. Tap a button, or type the command.
             title: "Recent alerts",
             text: `🔔 *Latest ${alerts.length} alerts* (${unacknowledged} unacknowledged)\n\n${lines.join("\n\n")}`,
             quoted,
-            buttons: [this.quickReply("📊 Status", ".status"), this.quickReply("📋 Menu", ".menu")],
+            buttons: await this.contextButtons(3, [{ label: "🔔 Refresh alerts", id: ".alerts" }]),
             fallbackHint: "Commands: .alerts • .status",
         });
     }
@@ -1281,10 +1504,19 @@ Owner-only. Tap a button, or type the command.
         await this.sendText(jid, `🗺 *${map.name || "Field"}* — ${map.blocks.length} block(s)\n${lines.join("\n")}`, quoted);
     }
 
+    private static readonly HEALTH_LABEL: Record<SessionHealth, string> = {
+        active: "✅ active (connected)",
+        inactive: "⚪️ inactive (session on disk, bot switched off)",
+        invalid: "❌ invalid — the session was logged out, link the account again",
+        not_linked: "➖ no account linked yet",
+    };
+
     private async sendSession(jid: string, quoted: WAMessage): Promise<void> {
         const status = await this.getStatus();
         const lines = [
             "🔗 *WhatsApp service*",
+            `• bot: *${status.enabled ? "ON" : "OFF"}*`,
+            `• session: ${WhatsAppService.HEALTH_LABEL[status.sessionHealth]}`,
             `• state: *${status.state}*`,
             `• linked number: ${status.linkedNumber ?? "-"}`,
             `• owner number: ${status.ownerNumber ?? "-"}`,
@@ -1292,12 +1524,51 @@ Owner-only. Tap a button, or type the command.
         ];
         if (status.pairingCode) lines.push(`• pairing code: *${status.pairingCode}*`);
         if (status.lastError) lines.push(`• last error: ${status.lastError}`);
+        lines.push("", status.enabled ? "Switch the bot off with `.bot off`." : "Switch the bot on with `.bot on`.");
+
         await this.sendInteractive(jid, {
             title: "WhatsApp session",
             text: lines.join("\n"),
             quoted,
-            buttons: [this.quickReply("📋 Menu", ".menu"), this.quickReply("📊 Status", ".status")],
+            buttons: status.enabled
+                ? [this.quickReply("🛑 Bot OFF", ".bot off"), this.quickReply("📊 Status", ".status"), this.quickReply("📋 Menu", ".menu")]
+                : [this.quickReply("🚀 Bot ON", ".bot on"), this.quickReply("📊 Status", ".status"), this.quickReply("📋 Menu", ".menu")],
             fallbackHint: "Manage linking from the dashboard: Settings → WhatsApp Service.",
+        });
+    }
+
+    /** `.bot` — the WhatsApp service's own ON/OFF switch, from the chat. */
+    private async botCommand(args: string, jid: string, quoted: WAMessage): Promise<void> {
+        const [sub = ""] = args.split(/\s+/).filter(Boolean);
+        const action = sub.toLowerCase();
+
+        if (["on", "start", "enable", "resume"].includes(action)) {
+            const status = await this.setEnabled(true);
+            if (!status.sessionExists) {
+                return this.sendText(jid, "⚠️ No linked account yet — pair one from *Settings → WhatsApp Service* in the dashboard first (`.session` shows the state).", quoted,
+                    [this.quickReply("🔗 Session state", ".session"), this.quickReply("📋 Menu", ".menu")]);
+            }
+            return this.sendText(jid, `🚀 *WhatsApp bot ON* — reconnecting with the saved session.\n• state: ${status.state}`, quoted,
+                [this.quickReply("🔗 Session state", ".session"), this.quickReply("📊 Status", ".status")]);
+        }
+
+        if (["off", "stop", "disable", "pause"].includes(action)) {
+            // Send the confirmation BEFORE the socket goes away, then switch off.
+            await this.sendText(jid, "🛑 *WhatsApp bot OFF.*\nThe session stays saved on the server — say `.bot on` (or use the dashboard switch) to start it again.", quoted,
+                [this.quickReply("📋 Menu", ".menu")]);
+            setTimeout(() => { void this.setEnabled(false).catch(() => undefined); }, 750);
+            return;
+        }
+
+        const status = await this.getStatus();
+        return this.sendInteractive(jid, {
+            title: "WhatsApp bot switch",
+            text: `🔌 *Bot:* ${status.enabled ? "ON" : "OFF"}\n• session: ${WhatsAppService.HEALTH_LABEL[status.sessionHealth]}\n• state: ${status.state}`,
+            quoted,
+            buttons: status.enabled
+                ? [this.quickReply("🛑 Turn OFF", ".bot off"), this.quickReply("🔗 Session", ".session")]
+                : [this.quickReply("🚀 Turn ON", ".bot on"), this.quickReply("🔗 Session", ".session")],
+            fallbackHint: "Usage: .bot on • .bot off • .session",
         });
     }
 

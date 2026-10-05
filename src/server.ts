@@ -414,6 +414,15 @@ export class Server {
             } catch (e) { next(e); }
         });
 
+        this.app.post("/api/whatsapp/enabled", this.authorizeClient, async (req, res, next) => {
+            try {
+                // The Settings switch: ON reconnects with the saved session, OFF
+                // only stops the socket (the session stays on disk for a later ON).
+                const status = await WhatsAppService.getInstance(logger, this.db).setEnabled(Boolean(req.body?.enabled));
+                res.send({ ok: true, ...status });
+            } catch (e) { next(e); }
+        });
+
         this.app.post("/api/whatsapp/unlink", this.authorizeClient, async (_req, res, next) => {
             try {
                 const status = await WhatsAppService.getInstance(logger, this.db).unlink();

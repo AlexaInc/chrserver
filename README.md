@@ -335,9 +335,14 @@ The client card calls these authorized endpoints (`Authorization: Bearer <token>
 | `GET`  | `/api/whatsapp`          | current state: `disabled / idle / pairing / connected`, numbers, pairing code |
 | `POST` | `/api/whatsapp/link`     | `{ "number": "94766045156" }` → pair that account, returns the pairing code |
 | `POST` | `/api/whatsapp/relink`   | delete the current session and pair a different account                 |
+| `POST` | `/api/whatsapp/enabled`  | `{ "enabled": true\|false }` → the bot's ON/OFF switch (OFF stops the socket, keeps the session) |
 | `POST` | `/api/whatsapp/unlink`   | **delete the session** (signs the account out); keeps the owner number   |
 | `POST` | `/api/whatsapp/owner`    | `{ "number": "94766045156" }` → save the commander number                |
 | `POST` | `/api/whatsapp/test`     | send a test message to the owner number                                  |
+
+`GET /api/whatsapp` also reports `sessionHealth` — `active` (connected), `inactive`
+(session saved, bot switched off), `invalid` (the account was logged out, link it again) or
+`not_linked` — which is what the app's Settings card shows next to the ON/OFF switch.
 
 Numbers are stored in E.164 **digital** form — country code included, no `+`, no spaces
 (Sri Lanka `076 604 5156` → `94766045156`). Local formats are rejected on purpose: without a
@@ -360,14 +365,21 @@ the number you paired, and it can be changed at any time in the app or with `.ow
 | `.pump_auto on\|off` / `.pump_status` / `.pump_stop` | auto-irrigation mode, live state, abort a run                 |
 | `.pump threshold 45` / `.pump irrigate <block> 120`  | moisture threshold / irrigate one block                        |
 | `.alerts` · `.reports` · `.blocks`                   | last alerts · latest analysis report · field blocks             |
-| `.session` · `.owner` · `.owner set 94XXXXXXXXX`      | link state · owner number                                       |
+| `.bot on\|off`                                        | start/stop this WhatsApp service (session is kept when off)     |
+| `.session` · `.owner` · `.owner set 94XXXXXXXXX`      | bot + session health · owner number                             |
 
-Replies are native-flow interactive messages: **quick replies** (`.status`, `.pump_on 60`,
-`.pump_off`, …) plus a `single_select` list for the full menu, and a `cta_url` wall with the
-support contacts for anyone who is *not* the owner. Button taps arrive as
+Replies are native-flow interactive messages whose buttons are **derived from the live state**
+(`pumpButtons()` / `missionButtons()` in `WhatsAppService.ts`): while the pump runs you are
+offered *Pump OFF* and never another *Pump ON*; a loaded-but-paused mission offers
+*Resume* + *Stop*; nothing loaded offers *Deploy*; an offline robot offers only *Status* — so
+the same card is correct in every situation instead of showing a hardcoded on/off pair. A
+`single_select` list carries the full menu and a `cta_url` wall shows the support contacts to
+anyone who is *not* the owner. Button taps arrive as
 `buttonsResponseMessage` / `listResponseMessage` / `templateButtonReplyMessage` /
 `interactiveResponseMessage` and are normalised back into commands, so tapping behaves exactly
-like typing. **Every** outgoing message carries the footer `Powered by hazu@AlexaInc.github.io`.
+like typing. **Every** outgoing message carries the footer `Powered by hazu@AlexaInc.github.io`
+in the message's **native footer field** (never glued into the body); the footer only falls
+back into the text for the rare plain-text fallback when a client refuses the interactive payload.
 
 Optional environment variables:
 
