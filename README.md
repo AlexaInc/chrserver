@@ -25,6 +25,7 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
 - [Available Scripts](#available-scripts)
 - [REST API Reference](#rest-api-reference)
 - [Real-Time (Socket.IO) API](#real-time-socketio-api)
+- [WhatsApp Service](#whatsapp-service)
 - [Where This Fits in the Overall System](#where-this-fits-in-the-overall-system)
 - [Known Issues / To Do](#known-issues--to-do)
 - [Team](#team)
@@ -42,6 +43,9 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
 - **Structured logging** with [pino](https://getpino.io) (pretty-printed in development).
 - **Image upload validation** — accepts only `png` / `jpg` / `jpeg`, with a 10 MB JSON
   payload limit to accommodate image buffers.
+- **WhatsApp control bot** — pair one WhatsApp account with a pairing code and drive the whole
+farm from chat (mission deploy, pump on/off, telemetry, alerts). Owner-gated, interactive
+button replies, footer on every message.
 - **Centralized error handling** with environment-aware error messages.
 - Written in **TypeScript** with a class-based, chainable server setup.
 
@@ -308,6 +312,70 @@ const socket = io("http://<host>:8000", {
 
 > CORS for Socket.IO is currently open (`origin: true`) for `GET` and `POST`, suitable for
 > development. Tighten this before any public deployment.
+
+---
+
+## WhatsApp Service
+
+One WhatsApp account is paired to the server with a **pairing code** (no QR scan) and then
+controls the farm from a chat. Everything the bot does goes through the same entry points the
+dashboard uses (`WSServer.deployMission` / `setRobotMode` / `controlRobot` / `controlPump`), so
+online checks, route planning limits and audit behaviour are identical.
+
+> Implementation: [`src/services/WhatsAppService.ts`](src/services/WhatsAppService.ts) ·
+> owner number + link state live in the `settings` table (`whatsapp` key, see
+> [`db/Sqlight.ts`](db/Sqlight.ts) → `WhatsAppSettings`).
+
+### Pairing from the app (Settings → **WhatsApp Service**)
+
+The client card calls these authorized endpoints (`Authorization: Bearer <token>`):
+
+| Method | Route                    | Purpose                                                                 |
+| ------ | ------------------------ | ----------------------------------------------------------------------- |
+| `GET`  | `/api/whatsapp`          | current state: `disabled / idle / pairing / connected`, numbers, pairing code |
+| `POST` | `/api/whatsapp/link`     | `{ "number": "94766045156" }` → pair that account, returns the pairing code |
+| `POST` | `/api/whatsapp/relink`   | delete the current session and pair a different account                 |
+| `POST` | `/api/whatsapp/unlink`   | **delete the session** (signs the account out); keeps the owner number   |
+| `POST` | `/api/whatsapp/owner`    | `{ "number": "94766045156" }` → save the commander number                |
+| `POST` | `/api/whatsapp/test`     | send a test message to the owner number                                  |
+
+Numbers are stored in E.164 **digital** form — country code included, no `+`, no spaces
+(Sri Lanka `076 604 5156` → `94766045156`). Local formats are rejected on purpose: without a
+country code the bot can never reach that chat. On the first link the owner number defaults to
+the number you paired, and it can be changed at any time in the app or with `.owner set …`.
+
+### Chat commands (owner only)
+
+| Chat command                                        | What it does                                                  |
+| --------------------------------------------------- | ------------------------------------------------------------- |
+| `.menu` / `.help`                                   | command menu with quick replies + list buttons                 |
+| `.status` (`.rs`, `.robot`)                          | robot online/offline, mode, mission progress, last sensor tick, pump, alert count |
+| `.telemetry` (`.tlm`)                                | temperature, humidity, rain, ultrasonic, soil moisture, GPS    |
+| `.mission`                                           | pick a block (list buttons) → **deploy mission**               |
+| `.mission deploy <blockId\|all>` / `.mission_status` | deploy a route / show progress                                |
+| `.mission_pause` / `.mission_resume`                 | manual (paused) / autonomous patrol                            |
+| `.stop`                                             | emergency stop: halt movement + pause the patrol               |
+| `.photo`                                            | ask the rover for a photo                                      |
+| `.pump` / `.pump_on 60` / `.pump_off`                | **water pump** control (duration in seconds)                   |
+| `.pump_auto on\|off` / `.pump_status` / `.pump_stop` | auto-irrigation mode, live state, abort a run                 |
+| `.pump threshold 45` / `.pump irrigate <block> 120`  | moisture threshold / irrigate one block                        |
+| `.alerts` · `.reports` · `.blocks`                   | last alerts · latest analysis report · field blocks             |
+| `.session` · `.owner` · `.owner set 94XXXXXXXXX`      | link state · owner number                                       |
+
+Replies are native-flow interactive messages: **quick replies** (`.status`, `.pump_on 60`,
+`.pump_off`, …) plus a `single_select` list for the full menu, and a `cta_url` wall with the
+support contacts for anyone who is *not* the owner. Button taps arrive as
+`buttonsResponseMessage` / `listResponseMessage` / `templateButtonReplyMessage` /
+`interactiveResponseMessage` and are normalised back into commands, so tapping behaves exactly
+like typing. **Every** outgoing message carries the footer `Powered by hazu@AlexaInc.github.io`.
+
+Optional environment variables:
+
+| Variable             | Default     | Purpose                                                           |
+| -------------------- | ----------- | ----------------------------------------------------------------- |
+| `WA_SESSION_DIR`      | `wasession` | multi-file auth state folder                                       |
+| `WA_QUICK_REPLY`      | `true`      | set to `false` to send list buttons instead of quick replies       |
+| `WA_BRAND_IMAGE_URL`  | *(empty)*   | public https image used as the header of interactive cards         |
 
 ---
 

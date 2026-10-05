@@ -1,6 +1,6 @@
 import { Server, Socket } from "socket.io";
 import http from "http";
-import { logger } from "../index";
+import { logger } from "../logger";
 import { sessions } from "../server";
 import { config } from "../config/config";
 import { CHRDatabase, AlertSeverity } from "../../db/Sqlight";
@@ -75,6 +75,14 @@ export interface RobotStatus {
     totalWaypoints?: number;
     progress?: number;
     message?: string;
+}
+
+/** Reply shape shared by the socket ack and the REST/WhatsApp callers. */
+export interface CommandAck {
+    success: boolean;
+    message?: string;
+    reason?: string;
+    data?: unknown;
 }
 
 export class WSServer {
@@ -261,6 +269,110 @@ export class WSServer {
 
     private async broadcastStatus(): Promise<void> {
         this.io.to("authorized_room").emit("message.upsert", { Type: "status", Message: await this.computeStatus() });
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Command entry points                                                */
+    /*                                                                     */
+    /* The dashboard socket handler below and the WhatsApp service both    */
+    /* end up here, so a command typed in WhatsApp goes through exactly    */
+    /* the same checks, bookkeeping and audit trail as a button pressed    */
+    /* in the app (robot online? field map saved? waypoint limit?).        */
+    /* ------------------------------------------------------------------ */
+
+    /** The saved field map, or null when the operator has not mapped yet. */
+    public getFieldMap(): Promise<FieldMapMessage | null> {
+        return this.db.getSetting<FieldMapMessage | null>("fieldMap", null);
+    }
+
+    /** The persisted fleet defaults (spacing / thresholds / alert confidence). */
+    public getFleetConfig(): Promise<FleetConfig> {
+        return this.db.getSetting<FleetConfig>("fleetConfig", DEFAULT_FLEET_CONFIG);
+    }
+
+    /** Deploy (or re-deploy) an autonomous mission — same path as the app's
+     *  `deploy_mission` action: plan route → persist activeMission → stream the
+     *  chunks to the rover → broadcast state to every authorized client. */
+    public async deployMission(data: {
+        blocks?: string[]; rowSpacingM?: number; scanSpacingM?: number;
+        arrivalRadiusM?: number; headingDeg?: number;
+    } = {}, from?: string): Promise<CommandAck> {
+        try {
+            if (!this.isRobotOnline()) return { success: false, reason: "Robot offline" };
+            const map = await this.getFieldMap();
+            if (!map) return { success: false, reason: "Create and save a field map first" };
+            const fleetConfig = await this.getFleetConfig();
+            const requested = Array.isArray(data.blocks) && data.blocks.length ? data.blocks : [];
+            const blockIds = requested.length ? requested : map.blocks.map((b) => b.id);
+            const unknown = requested.filter((id) => !map.blocks.some((b) => b.id === id));
+            if (unknown.length) return { success: false, reason: `Unknown block(s): ${unknown.join(", ")}` };
+            const patrolId = await this.db.startPatrol(`Mission blocks: ${blockIds.join(",")}`);
+            const mission = planMission(map, blockIds, { ...fleetConfig, ...data }, patrolId);
+            if (mission.waypoints.length > 512) {
+                await this.db.completePatrol(patrolId);
+                return { success: false, reason: `Route has ${mission.waypoints.length} waypoints; increase row/photo spacing (device maximum: 512)` };
+            }
+            await this.db.setSetting("activeMission", mission);
+            this.lastMission = { missionId: mission.missionId, state: "running", currentWaypoint: 0, totalWaypoints: mission.waypoints.length, progress: 0 };
+            this.robotMode = "autonomous";
+            this.emitMissionChunks(
+                (event, payload) => this.io.to("esp_32_room").emit(event, payload),
+                mission,
+                false,
+                from,
+            );
+            this.io.to("authorized_room").emit("message.upsert", {
+                Type: "mission", Message: { ...mission, state: "deployed", currentWaypoint: 0 },
+            });
+            await this.broadcastStatus();
+            return { success: true, message: `Mission deployed: ${mission.waypoints.length} waypoints (${blockIds.length} block(s))`, data: mission };
+        } catch (error: any) {
+            return { success: false, reason: error?.message ?? "Mission planning failed" };
+        }
+    }
+
+    /** Switch the rover between autonomous patrol and manual driving. On this
+     *  firmware "manual" == autonomous patrol paused (see the mode comment above). */
+    public async setRobotMode(mode: "autonomous" | "manual", from?: string): Promise<CommandAck> {
+        if (!this.isRobotOnline()) return { success: false, reason: "Robot offline" };
+        const emit = (action: string) => this.io.to("esp_32_room").emit("control_command", {
+            ...(from ? { from } : {}),
+            command: { action, timestamp: Date.now() },
+        });
+        if (mode === "manual") {
+            this.robotMode = "manual";
+            emit("pause_patrol");
+            await this.broadcastStatus();
+            return { success: true, message: "Manual control enabled (autonomous patrol paused)" };
+        }
+        const active = await this.db.getSetting<AutonomousMission | null>("activeMission", null);
+        if (!active) return { success: false, reason: "No mission loaded to resume" };
+        this.robotMode = "autonomous";
+        emit("start_patrol");
+        await this.broadcastStatus();
+        return { success: true, message: "Autonomous patrol resumed" };
+    }
+
+    /** Forward one of the actions the ESP32 rover firmware really understands. */
+    public async controlRobot(action: string, data?: unknown, from?: string): Promise<CommandAck> {
+        if (!ROVER_ACTIONS.has(action)) return { success: false, reason: `Unknown action "${action}"` };
+        if (!this.isRobotOnline()) return { success: false, reason: "Robot offline" };
+        this.io.to("esp_32_room").emit("control_command", {
+            ...(from ? { from } : {}),
+            command: { action, ...(data !== undefined ? { data } : {}), timestamp: Date.now() },
+        });
+        return { success: true, message: `${action} forwarded`, data: { target: "esp_32_room" } };
+    }
+
+    /** Forward one of the ESP32-C3 pump controller actions. */
+    public async controlPump(action: string, data?: unknown, from?: string): Promise<CommandAck> {
+        if (!PUMP_ACTIONS.has(action)) return { success: false, reason: `Unknown action "${action}"` };
+        if (!this.isPumpOnline()) return { success: false, reason: "Pump controller offline" };
+        this.io.to("pump_room").emit("control_command", {
+            ...(from ? { from } : {}),
+            command: { action, ...(data !== undefined ? { data } : {}), timestamp: Date.now() },
+        });
+        return { success: true, message: `${action} forwarded`, data: { target: "pump_room" } };
     }
 
     /* ------------------------------------------------------------------ */
@@ -453,33 +565,7 @@ export class WSServer {
                     return ack({ success: true, message: "Configuration saved", data: merged });
                 }
                 if (data.action === "deploy_mission") {
-                    const online = this.isRobotOnline();
-                    if (!online) return ack({ success: false, reason: "Robot offline" });
-                    const map = await this.db.getSetting<FieldMapMessage | null>("fieldMap", null);
-                    if (!map) return ack({ success: false, reason: "Create and save a field map first" });
-                    const fleetConfig = await this.db.getSetting<FleetConfig>("fleetConfig", DEFAULT_FLEET_CONFIG);
-                    const blockIds = Array.isArray(data.data?.blocks) && data.data.blocks.length
-                        ? data.data.blocks : map.blocks.map((b) => b.id);
-                    const patrolId = await this.db.startPatrol(`Mission blocks: ${blockIds.join(",")}`);
-                    const mission = planMission(map, blockIds, { ...fleetConfig, ...data.data }, patrolId);
-                    if (mission.waypoints.length > 512) {
-                        await this.db.completePatrol(patrolId);
-                        return ack({ success: false, reason: `Route has ${mission.waypoints.length} waypoints; increase row/photo spacing (device maximum: 512)` });
-                    }
-                    await this.db.setSetting("activeMission", mission);
-                    this.lastMission = { missionId: mission.missionId, state: "running", currentWaypoint: 0, totalWaypoints: mission.waypoints.length, progress: 0 };
-                    this.robotMode = "autonomous";
-                    this.emitMissionChunks(
-                        (event, payload) => this.io.to("esp_32_room").emit(event, payload),
-                        mission,
-                        false,
-                        socket.id,
-                    );
-                    this.io.to("authorized_room").emit("message.upsert", {
-                        Type: "mission", Message: { ...mission, state: "deployed", currentWaypoint: 0 }
-                    });
-                    await this.broadcastStatus();
-                    return ack({ success: true, message: `Mission deployed: ${mission.waypoints.length} waypoints`, data: mission });
+                    return ack(await this.deployMission(data.data ?? {}, socket.id));
                 }
                 if (data.action === "start_patrol") await this.db.startPatrol("Started from client");
 
@@ -491,31 +577,13 @@ export class WSServer {
                     const wantsManual = data.action === "manual_teleop"
                         ? Boolean(data.data?.enabled)
                         : data.data?.mode === "manual" || data.data?.mode === "paused";
-                    const online = this.isRobotOnline();
-                    if (!online) return ack({ success: false, reason: "Robot offline" });
-                    if (wantsManual) {
-                        this.robotMode = "manual";
-                        this.io.to("esp_32_room").emit("control_command", { from: socket.id, command: { action: "pause_patrol" } });
-                        await this.broadcastStatus();
-                        return ack({ success: true, message: "Manual control enabled (autonomous patrol paused)" });
-                    }
-                    const active = await this.db.getSetting<AutonomousMission | null>("activeMission", null);
-                    if (!active) return ack({ success: false, reason: "No mission loaded to resume" });
-                    this.robotMode = "autonomous";
-                    this.io.to("esp_32_room").emit("control_command", { from: socket.id, command: { action: "start_patrol" } });
-                    await this.broadcastStatus();
-                    return ack({ success: true, message: "Autonomous patrol resumed" });
+                    return ack(await this.setRobotMode(wantsManual ? "manual" : "autonomous", socket.id));
                 }
 
-                const targetRoom = PUMP_ACTIONS.has(data.action) ? "pump_room" : "esp_32_room";
-                if (targetRoom === "esp_32_room" && !ROVER_ACTIONS.has(data.action)) {
-                    return ack({ success: false, reason: `Unknown action "${data.action}"` });
+                if (PUMP_ACTIONS.has(data.action)) {
+                    return ack(await this.controlPump(data.action, data.data, socket.id));
                 }
-                const online = (await this.io.in(targetRoom).fetchSockets()).length > 0;
-                if (!online) return ack({ success: false, reason: targetRoom === "pump_room" ? "Pump controller offline" : "Robot offline" });
-
-                this.io.to(targetRoom).emit("control_command", { from: socket.id, command: data });
-                ack({ success: true, message: `${data.action} forwarded`, data: { target: targetRoom } });
+                return ack(await this.controlRobot(data.action, data.data, socket.id));
             } catch (error: any) {
                 logger.error({ error }, "Control command failed");
                 ack({ success: false, reason: error?.message ?? "Command failed" });

@@ -4,11 +4,12 @@ import cors from "cors";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { logger } from "./index";
+import { logger } from "./logger";
 import { config } from "./config/config";
 import { WSServer, FieldMapMessage, blockAt, FleetConfig, DEFAULT_FLEET_CONFIG } from "./sockets/wsserver";
 import { LoadedPlantModel, predictPlant } from "./services/LoadAimodels";
 import { CHRDatabase } from "../db/Sqlight";
+import { WhatsAppService, normalizeWhatsAppNumber } from "./services/WhatsAppService";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 export const sessions = new Map<string, string>();
@@ -378,6 +379,62 @@ export class Server {
         this.app.post("/api/pump/command", this.authorizeClient, (req, res) => {
             WSServer.getInstance().io.to("pump_room").emit("control_command", { command: req.body });
             res.send({ ok: true });
+        });
+
+        /* ---------------------------------------------------------------- */
+        /* WhatsApp service — link / unlink / relink / owner number          */
+        /*                                                                   */
+        /* These are what the client's Settings → "WhatsApp Service" card    */
+        /* calls: pair a fresh account with a pairing code, delete the       */
+        /* session, relink a different account, and store the owner number   */
+        /* (country code required) that the bot's command gate checks.      */
+        /* ---------------------------------------------------------------- */
+
+        this.app.get("/api/whatsapp", this.authorizeClient, async (_req, res, next) => {
+            try {
+                res.send({ ok: true, ...(await WhatsAppService.getInstance(logger, this.db).getStatus()) });
+            } catch (e) { next(e); }
+        });
+
+        this.app.post("/api/whatsapp/link", this.authorizeClient, async (req, res, next) => {
+            try {
+                const number = normalizeWhatsAppNumber(String(req.body?.number ?? ""));
+                if (!number) return res.status(400).send({ ok: false, message: "Enter the WhatsApp number with its country code and digits only (example: 94766045156)" });
+                const status = await WhatsAppService.getInstance(logger, this.db).link(number);
+                res.send({ ok: true, ...status });
+            } catch (e) { next(e); }
+        });
+
+        this.app.post("/api/whatsapp/relink", this.authorizeClient, async (req, res, next) => {
+            try {
+                const number = normalizeWhatsAppNumber(String(req.body?.number ?? ""));
+                if (!number) return res.status(400).send({ ok: false, message: "Enter the WhatsApp number with its country code and digits only (example: 94766045156)" });
+                const status = await WhatsAppService.getInstance(logger, this.db).relink(number);
+                res.send({ ok: true, ...status });
+            } catch (e) { next(e); }
+        });
+
+        this.app.post("/api/whatsapp/unlink", this.authorizeClient, async (_req, res, next) => {
+            try {
+                const status = await WhatsAppService.getInstance(logger, this.db).unlink();
+                res.send({ ok: true, ...status });
+            } catch (e) { next(e); }
+        });
+
+        this.app.post("/api/whatsapp/owner", this.authorizeClient, async (req, res, next) => {
+            try {
+                const number = normalizeWhatsAppNumber(String(req.body?.number ?? ""));
+                if (!number) return res.status(400).send({ ok: false, message: "Enter the owner number with its country code and digits only (example: 94766045156)" });
+                const status = await WhatsAppService.getInstance(logger, this.db).setOwnerNumber(number);
+                res.send({ ok: true, ...status });
+            } catch (e) { next(e); }
+        });
+
+        this.app.post("/api/whatsapp/test", this.authorizeClient, async (_req, res, next) => {
+            try {
+                const status = await WhatsAppService.getInstance(logger, this.db).sendTestMessage();
+                res.send({ ok: true, ...status });
+            } catch (e) { next(e); }
         });
         return this;
     }

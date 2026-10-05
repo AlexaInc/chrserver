@@ -132,6 +132,42 @@ export interface AlertRow {
     acknowledged_at: number | null;
 }
 
+/* ------------------------------------------------------------------ */
+/* WhatsApp service state                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Persisted WhatsApp-service state (settings key `whatsapp`).
+ *
+ * Numbers are stored in E.164 *digital* form — country code included, no
+ * `+`, no spaces, no leading `0` — e.g. Sri Lanka 076 604 5156 becomes
+ * "94766045156". Everything the bot compares (command gate) and everything
+ * the frontend shows comes from here, so the owner number survives server
+ * restarts instead of being a hardcoded `null`.
+ */
+export interface WhatsAppSettings {
+    /** The ONLY number allowed to issue control commands (country code included). */
+    ownerNumber: string | null;
+    /** Start the WhatsApp service automatically on boot. */
+    enabled: boolean;
+    /** Number the current/past bot session was paired for (country code included). */
+    linkedNumber: string | null;
+    /** epoch ms of the last successful pairing. */
+    linkedAt: number | null;
+    /** LIDs we have learned belong to the owner (WhatsApp hides the phone
+     *  number of some chats behind `@lid`; we remember the ones the owner
+     *  actually sent from so the gate keeps working). */
+    ownerLids: string[];
+}
+
+export const DEFAULT_WHATSAPP_SETTINGS: WhatsAppSettings = {
+    ownerNumber: null,
+    enabled: false,
+    linkedNumber: null,
+    linkedAt: null,
+    ownerLids: [],
+};
+
 /** What the rover ("esp_32") actually reports per tick — Type:"sensors". */
 export interface RoverSensorMessage {
     temperature?: number;
@@ -649,6 +685,27 @@ export class CHRDatabase {
         const r = await this.db.run(
             `UPDATE alerts SET acknowledged_at=? WHERE acknowledged_at IS NULL`, now());
         return r.changes ?? 0;
+    }
+
+    /* ================================================================ */
+    /* WhatsApp service state (owner number + session bookkeeping)       */
+    /* ================================================================ */
+
+    /** Full WhatsApp settings, defaults filled in for older DBs. */
+    public async getWhatsAppSettings(): Promise<WhatsAppSettings> {
+        const stored = await this.getSetting<Partial<WhatsAppSettings>>("whatsapp", {});
+        return {
+            ...DEFAULT_WHATSAPP_SETTINGS,
+            ...stored,
+            ownerLids: Array.isArray(stored.ownerLids) ? stored.ownerLids : [],
+        };
+    }
+
+    /** Merge-and-save (partial updates are fine). */
+    public async saveWhatsAppSettings(patch: Partial<WhatsAppSettings>): Promise<WhatsAppSettings> {
+        const merged: WhatsAppSettings = { ...(await this.getWhatsAppSettings()), ...patch };
+        await this.setSetting("whatsapp", merged);
+        return merged;
     }
 
     /* ================================================================ */

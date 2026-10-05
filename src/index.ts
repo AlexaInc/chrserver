@@ -1,4 +1,3 @@
-import pino, { Logger } from "pino";
 import { Server } from "./server";
 import { WSServer } from "./sockets/wsserver";
 import { loadAllPlantModels } from "./services/LoadAimodels";
@@ -6,22 +5,11 @@ import { WhatsAppService } from "./services/WhatsAppService";
 import { startDuckDNSUpdater } from "./services/Duckdns";
 import { exec, ChildProcess } from "child_process";
 import {config} from "./config/config";
+import { logger } from "./logger";
 import { CHRDatabase } from "../db/Sqlight";
-const isDev: boolean = process.env.NODE_ENV !== 'production';
-
-export const logger: Logger<never, boolean> = pino({
-    level: process.env.LOG_LEVEL || (isDev ? 'debug' : 'info'),
-    transport: isDev
-        ? {
-            target: 'pino-pretty',
-            options: {
-                colorize: true,
-                translateTime: 'SYS:standard',
-                ignore: 'pid,hostname',
-            },
-        }
-        : undefined,
-});
+// The logger moved to its own module (src/logger.ts) so services can import it
+// without booting this entry point; re-exported here for existing imports.
+export { logger } from "./logger";
 
 const server = new Server({ port: config.port, domain: '0.0.0.0' });
 
@@ -31,7 +19,6 @@ async function startApp() {
         CHRDatabase.open(),
     ]);
     const routeoptions = { models, db };
-
     server.configureMiddleware();
     server.setupRoutes(routeoptions);
     server.configureErrorHandling();
@@ -68,19 +55,18 @@ async function startApp() {
 
     const wsServer = new WSServer(httpServer, db);
     wsServer.setup();
+
+    // WhatsApp LAST: it needs the database (owner number + link state) and the
+    // WSServer instance (robot/pump commands). autoStart() only connects when the
+    // DB says the service is enabled AND a session exists on disk — a fresh
+    // install stays idle until an account is paired from Settings → WhatsApp.
+    const whatsapp = WhatsAppService.getInstance(logger, db);
+    void whatsapp.autoStart();
 }
 
-startApp();
+void startApp();
 
+/** Kept so existing imports keep working; the app boots the service itself now. */
 export const initWhatsAppOnStartup = async () => {
-    try {
-        const wabot = WhatsAppService.getInstance(logger);
-        await wabot.init();
-        await wabot.start();
-        logger.info('WhatsApp service auto-started from existing session.');
-    } catch (error) {
-        logger.error('Failed to auto-start WhatsApp session:'+ error);
-    }
+    await WhatsAppService.getInstance(logger).autoStart();
 };
-
-initWhatsAppOnStartup();

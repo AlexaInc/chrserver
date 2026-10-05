@@ -3,7 +3,7 @@ import {config} from "../config/config";
 const DOMAIN: string = config.Domain;
 const TOKEN: string = config.DuckdnsToken;
 // console.log(config)
-import {logger} from "../index";
+import {logger} from "../logger";
 async function updateDuckDNS(): Promise<void> {
     const url = `https://www.duckdns.org/update?domains=${DOMAIN}&token=${TOKEN}`;
 
