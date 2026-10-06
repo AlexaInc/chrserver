@@ -23,3 +23,7 @@ dist/
 /data/
 .env
 **.patch
+
+# Web app build published by the chrclient CI into public/ (never committed)
+/public/
+/.webapp/

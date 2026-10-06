@@ -13,6 +13,7 @@
     "@tensorflow/tfjs": "^4.22.0",
     "@types/dotenv": "^6.1.1",
     "@types/express": "^5.0.6",
+    "adm-zip": "^0.5.18",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
@@ -25,6 +26,7 @@
     "sqlite3": "^6.0.1"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
     "@types/cors": "^2.8.19",
     "@types/multer": "^2.2.0",
     "@types/node": "^22.20.2",

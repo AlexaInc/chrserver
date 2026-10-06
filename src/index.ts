@@ -2,6 +2,7 @@ import { Server } from "./server";
 import { WSServer } from "./sockets/wsserver";
 import { loadAllPlantModels } from "./services/LoadAimodels";
 import { WhatsAppService } from "./services/WhatsAppService";
+import { WebAppRelease } from "./services/WebAppRelease";
 import { startDuckDNSUpdater } from "./services/Duckdns";
 import { exec, ChildProcess } from "child_process";
 import {config} from "./config/config";
@@ -22,6 +23,12 @@ async function startApp() {
     server.configureMiddleware();
     server.setupRoutes(routeoptions);
     server.configureErrorHandling();
+
+    // Web app: look for a newer chrclient web build and serve the newest copy.
+    // Startup is never blocked by this — the server serves whatever build is
+    // already in public/ (if any) while the check runs in the background, and
+    // an unreachable GitHub leaves that copy in place.
+    WebAppRelease.getInstance().start();
 
     const httpServer = server.app.listen(Number(server.port), server.domain, (): void => {
         logger.info(`🚀 Server started successfully at http://${server.domain}:${server.port}`);

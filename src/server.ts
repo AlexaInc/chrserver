@@ -10,6 +10,7 @@ import { WSServer, FieldMapMessage, blockAt, FleetConfig, DEFAULT_FLEET_CONFIG }
 import { LoadedPlantModel, predictPlant } from "./services/LoadAimodels";
 import { CHRDatabase } from "../db/Sqlight";
 import { WhatsAppService, normalizeWhatsAppNumber } from "./services/WhatsAppService";
+import { WebAppRelease } from "./services/WebAppRelease";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 export const sessions = new Map<string, string>();
@@ -51,7 +52,23 @@ export class Server {
         this.models = options.models;
         this.db = options.db;
 
-        this.app.get("/health", (_req, res) => res.send({ ok: true, service: "chrserver", time: Date.now(), models: this.models.map((m) => m.plant) }));
+        this.app.get("/health", (_req, res) => {
+            const web = WebAppRelease.getInstance().getStatus();
+            res.send({
+                ok: true,
+                service: "chrserver",
+                time: Date.now(),
+                models: this.models.map((m) => m.plant),
+                webApp: {
+                    serving: web.serving,
+                    release: web.tag || null,
+                    asset: web.assetName,
+                    downloadedAt: web.downloadedAt,
+                    lastResult: web.lastResult,
+                    lastCheckAt: web.lastCheckAt,
+                },
+            });
+        });
 
         this.app.post("/auth/login", (req, res) => {
             const { username, password, nonce } = req.body ?? {};
@@ -450,6 +467,31 @@ export class Server {
                 res.send({ ok: true, ...status });
             } catch (e) { next(e); }
         });
+
+        /* ---------------------------------------------------------------- */
+        /* Web app (the chrclient web build this server publishes)           */
+        /* ---------------------------------------------------------------- */
+
+        this.app.get("/api/webapp", this.authorizeClient, (_req, res) => {
+            const status = WebAppRelease.getInstance().getStatus();
+            res.send({ ok: true, ...status });
+        });
+
+        // Force a re-check against GitHub. ?force=1 also re-downloads the same
+        // build (normally an unchanged fingerprint means "no download at all").
+        this.app.post("/api/webapp/refresh", this.authorizeClient, async (req, res, next) => {
+            try {
+                const force = ["1", "true", "yes"].includes(String(req.query.force ?? req.body?.force ?? "").toLowerCase());
+                const status = await WebAppRelease.getInstance().check(force);
+                res.send({ ok: true, forced: force, ...status });
+            } catch (e) { next(e); }
+        });
+
+        // Serve the published build. Registered LAST, and it only answers paths
+        // the API above did not claim, so /api, /auth, /health and /socket.io
+        // keep behaving exactly as before.
+        WebAppRelease.getInstance().mount(this.app);
+
         return this;
     }
 

@@ -25,6 +25,7 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
 - [Available Scripts](#available-scripts)
 - [REST API Reference](#rest-api-reference)
 - [Real-Time (Socket.IO) API](#real-time-socketio-api)
+- [Serving the web app (chrclient web build)](#serving-the-web-app-chrclient-web-build)
 - [WhatsApp Service](#whatsapp-service)
 - [Where This Fits in the Overall System](#where-this-fits-in-the-overall-system)
 - [Known Issues / To Do](#known-issues--to-do)
@@ -50,6 +51,8 @@ button replies, footer on every message.
 - Written in **TypeScript** with a class-based, chainable server setup.
 
 ---
+
+- **Serves the web dashboard** — the newest `chrclient` web build is fetched from its GitHub release into `public/` at startup and served on `/` (no download at all when the copy on disk is already the newest; the API paths stay untouched).
 
 ## Tech Stack
 
@@ -191,6 +194,16 @@ Configuration is currently minimal and read from environment variables:
 | `npm run build` | Compile TypeScript to JavaScript in `dist/`.       |
 
 ---
+
+Regression suites (run them in the repository root):
+
+```bash
+npm i --no-save socket.io-client     # test-only dependency
+npx tsx chrserver-verify-safety.ts   # robot safety / speed / arc telemetry
+npx tsx chrserver-verify-whatsapp.ts # WhatsApp link, commands and footers
+npx tsx chrserver-verify-webapp.ts   # web build sync + serving (no network needed)
+```
+
 
 ## REST API Reference
 
@@ -483,6 +496,63 @@ Optional environment variables:
 | `WA_BRAND_IMAGE_URL`  | *(empty)*   | public https image used as the header of interactive cards         |
 
 ---
+
+## Serving the web app (chrclient web build)
+
+`AlexaInc/chrserver` also publishes the **web version of the dashboard**, so
+`https://<your-domain>/` opens the same app the phone runs — no separate web
+host, and the operator never has to copy a build anywhere.
+
+**What happens at startup**
+
+| Step | What the server does |
+| ---- | ---- |
+| 1 | asks GitHub for the release tag `latest` of `AlexaInc/chrclient` (`GET /repos/AlexaInc/chrclient/releases/tags/latest`) |
+| 2 | fingerprints the `chrclient-web*.zip` asset by `asset.id + size + updated_at` |
+| 3 | **fingerprint already on disk → nothing is downloaded**; the existing `public/` folder is served as it is |
+| 4 | fingerprint differs (a new build was pushed) → downloads the asset, verifies `sha256` against GitHub's `digest`, unpacks it next to the live folder and swaps it in atomically |
+| 5 | GitHub unreachable → the last good build keeps being served, and the reason is reported (never a blank page) |
+
+Startup is never blocked: the server answers requests immediately and serves
+whatever build is already in `public/` while the check runs in the background.
+
+**URLs**
+
+| URL | What it is |
+| --- | --- |
+| `/` (+ any path such as `/robot`) | the web app (SPA deep links fall back to `index.html`) |
+| `/api/webapp` | release/status JSON: `serving`, `tag`, `assetName`, `sha256`, `downloadedAt`, `lastResult`, `lastError`, `checks`, `downloads` (client login required) |
+| `POST /api/webapp/refresh` | force a check; `?force=1` re-downloads even when the fingerprint matches (client login required) |
+| `/health` | now includes `webApp: { serving, release, asset, downloadedAt, lastResult, lastCheckAt }` (public) |
+
+`/api`, `/auth`, `/health` and `/socket.io` are never swallowed by the web app —
+the static mount is registered last and skips those prefixes, so a typo like
+`/api/does-not-exist` still answers **404** instead of serving HTML.
+
+**Settings** (`.env`, all optional apart from the defaults):
+
+```env
+WEBAPP_ENABLED=true                 # false = serve whatever is in public/, never check
+WEBAPP_REPO=AlexaInc/chrclient      # where the web build is published
+WEBAPP_RELEASE_TAG=latest           # the rolling release the CI keeps replacing
+WEBAPP_ROOT=public                  # folder that gets served
+WEBAPP_STATE_DIR=.webapp            # release.json (fingerprint) + unpack staging
+WEBAPP_CHECK_INTERVAL_MS=0          # 0 = startup only, e.g. 3600000 = hourly
+GITHUB_TOKEN=                       # only needed for a private app repository
+WEBAPP_API_BASE=https://api.github.com   # override for tests / a GitHub proxy
+```
+
+`public/` and `.webapp/` are runtime folders and are git-ignored — the web build
+is fetched from the release, never committed.
+
+**Caching:** files under `/_expo/static/` and `/assets/` have content-hashed
+names and are served `immutable` for a year; `index.html` is sent `no-cache`, so
+after a new release a browser refresh is all it takes.
+
+> Regression suite: `npx tsx chrserver-verify-webapp.ts` — 49 checks against a
+> fake GitHub API and a real zip: download-once, no-download-when-current,
+> atomic swap, offline fallback, checksum / zip-slip / missing-index guards and
+> the express mount (deep links, cache headers, API paths untouched).
 
 ## Where This Fits in the Overall System
 
