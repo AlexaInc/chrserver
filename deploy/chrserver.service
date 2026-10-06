@@ -1,0 +1,31 @@
+# chrserver — systemd unit installed by deploy/setup-vps.sh (kept here so the
+# VPS copy can be diffed against the repository copy).
+# Paths are substituted by setup-vps.sh (__ROOT__ / __USER__ / __PORT__).
+[Unit]
+Description=chrserver — AI Crop Robot backend
+Documentation=https://github.com/AlexaInc/chrserver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__ROOT__/current
+# The .env the deploy installs (src/config/.env is a symlink to shared/.env).
+Environment=NODE_ENV=production
+# PORT is deliberately NOT set here: the .env is the single source of
+# truth for it (dotenv never overrides a variable that already exists)
+Environment=ENV_FILE=__ROOT__/current/src/config/.env
+ExecStart=/usr/bin/node __ROOT__/current/dist/src/index.js
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=chrserver
+TimeoutStopSec=20
+KillSignal=SIGINT
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

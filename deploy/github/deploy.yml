@@ -1,0 +1,281 @@
+# =============================================================================
+#  chrserver — build on GitHub, deploy to the VPS over SSH
+#
+#  Push to main (or run this workflow by hand) and it will:
+#     1. install the dependencies and compile TypeScript (dist/)
+#     2. run the server verification suites (informative, never blocks)
+#     3. pack the release (dist + db + src + deploy + package files)
+#     4. copy it to the VPS, write src/config/.env from the ENV_CONTENT secret,
+#        install production dependencies, restart the service
+#     5. wait for /health; if the new release does not answer, the VPS script
+#        puts the previous release back automatically
+#
+#  Required repository secrets (Settings → Secrets and variables → Actions):
+#     VPS_HOST        IP or hostname of the VPS
+#     VPS_USER        SSH user (root, or a user with passwordless sudo)
+#     VPS_SSH_KEY     the private key for that user (whole PEM text)
+#                     — or VPS_SSH_KEY_BASE64 with the base64 of the same file
+#     ENV_CONTENT     the whole .env file, exactly as it should be written to
+#                     src/config/.env (multi-line secret)
+#  Optional secrets: ENV_CONTENT_BASE64
+#  Optional variables: VPS_PORT (default 22), VPS_ROOT (default /srv/chrserver)
+# =============================================================================
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "db/**"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - "deploy/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+    inputs:
+      rollback:
+        description: "Roll back to the previous release instead of deploying"
+        type: boolean
+        default: false
+      release_note:
+        description: "Optional note shown in the run summary"
+        type: string
+        default: ""
+
+concurrency:
+  group: deploy-chrserver-vps
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "20"
+  VPS_ROOT: ${{ vars.VPS_ROOT != '' && vars.VPS_ROOT || '/srv/chrserver' }}
+  VPS_PORT: ${{ vars.VPS_PORT != '' && vars.VPS_PORT || '22' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build the release bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Compile TypeScript
+        run: npm run build
+
+      - name: Check the entry point exists
+        run: |
+          set -euo pipefail
+          # tsc keeps the folder layout: the entry point is dist/src/index.js
+          # (db/ sits outside src/, so the common root is the project root)
+          test -f dist/src/index.js || { echo "dist/src/index.js is missing"; exit 1; }
+          test -f dist/db/Sqlight.js || { echo "dist/db/Sqlight.js is missing"; exit 1; }
+          echo "entry point: dist/src/index.js ($(du -sh dist | cut -f1))"
+
+      - name: Server verification suites (informative)
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          for suite in chrserver-verify-push.ts chrserver-verify-task7.ts \
+                       chrserver-verify-safety.ts chrserver-verify-webapp.ts \
+                       chrserver-verify-whatsapp.ts; do
+            [ -f "$suite" ] || continue
+            echo "── $suite"
+            npx tsx "$suite" 2>&1 | tail -5 || true
+          done
+
+      - name: Pack the release
+        id: pack
+        run: |
+          set -euo pipefail
+          SHA_SHORT="$(git rev-parse --short HEAD)"
+          BUNDLE="chrserver-${SHA_SHORT}.tgz"
+          tar --exclude='./src/config/.env' \
+              -czf "/tmp/$BUNDLE" \
+              dist db src deploy package.json package-lock.json tsconfig.json .env.example README.md
+          echo "bundle=$BUNDLE" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$SHA_SHORT" >> "$GITHUB_OUTPUT"
+          ls -l "/tmp/$BUNDLE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chrserver-bundle
+          path: /tmp/chrserver-*.tgz
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to the VPS
+    needs: build
+    if: ${{ github.event_name == 'push' || github.event.inputs.rollback != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: chrserver-bundle
+          path: /tmp/bundle
+
+      - name: Prepare the .env from the ENV_CONTENT secret
+        env:
+          ENV_CONTENT: ${{ secrets.ENV_CONTENT }}
+          ENV_CONTENT_BASE64: ${{ secrets.ENV_CONTENT_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ENV_CONTENT_BASE64:-}" ]; then
+            printf '%s' "$ENV_CONTENT_BASE64" | base64 -d > /tmp/chrserver.env
+            echo "using ENV_CONTENT_BASE64"
+          elif [ -n "${ENV_CONTENT:-}" ]; then
+            printf '%s\n' "$ENV_CONTENT" > /tmp/chrserver.env
+            echo "using ENV_CONTENT"
+          else
+            echo "::error::neither ENV_CONTENT nor ENV_CONTENT_BASE64 is set — the server needs its .env"
+            exit 1
+          fi
+          chmod 600 /tmp/chrserver.env
+          echo "env lines: $(wc -l < /tmp/chrserver.env | tr -d ' ')"
+          # never print the values, only the keys
+          echo "keys: $(grep -oE '^[A-Za-z_][A-Za-z0-9_]*' /tmp/chrserver.env | paste -sd, -)"
+          if grep -qiE '^(ADMIN_PASSWORD|ROBOT_TOKEN|PUMP_TOKEN)=?(replace|change-this|$)' /tmp/chrserver.env; then
+            echo "::warning::the .env still looks like the placeholder values from .env.example"
+          fi
+
+      - name: Set up SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_SSH_KEY_BASE64: ${{ secrets.VPS_SSH_KEY_BASE64 }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ env.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ -n "${VPS_SSH_KEY_BASE64:-}" ]; then
+            printf '%s' "$VPS_SSH_KEY_BASE64" | base64 -d > ~/.ssh/vps_key
+          elif [ -n "${VPS_SSH_KEY:-}" ]; then
+            printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
+          else
+            echo "::error::VPS_SSH_KEY (or VPS_SSH_KEY_BASE64) is not set"
+            exit 1
+          fi
+          chmod 600 ~/.ssh/vps_key
+          sed -i 's/\r$//' ~/.ssh/vps_key          # keys pasted with Windows endings
+          ssh-keygen -y -f ~/.ssh/vps_key > /dev/null || { echo "::error::the key is not a usable private key"; exit 1; }
+          ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "SSH_OPTS=-p ${VPS_PORT} -i ~/.ssh/vps_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" >> "$GITHUB_ENV"
+
+      - name: Upload the bundle and the .env
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          set -euo pipefail
+          BUNDLE="$(ls /tmp/bundle/chrserver-*.tgz | head -1)"
+          echo "BUNDLE_NAME=$(basename "$BUNDLE")" >> "$GITHUB_ENV"
+          scp $SSH_OPTS "$BUNDLE" /tmp/chrserver.env "$VPS_USER@$VPS_HOST:/tmp/"
+          echo "uploaded $(basename "$BUNDLE") + .env"
+
+      - name: Run the deploy on the VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          set -euo pipefail
+          SHA="/tmp/$BUNDLE_NAME"
+          ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" bash -s <<REMOTE
+          set -euo pipefail
+          WORK="\$(mktemp -d)"
+          tar -xzf "$SHA" -C "\$WORK" deploy
+          SUDO=""; [ "\$(id -u)" = "0" ] || SUDO="sudo -n"
+          \$SUDO bash "\$WORK/deploy/deploy.sh" "$SHA" "${GITHUB_SHA:0:8}" --env-file /tmp/chrserver.env
+          ROOT="${VPS_ROOT:-/srv/chrserver}"
+          echo
+          echo "===== status ====="
+          \$SUDO bash "\$ROOT/current/deploy/deploy.sh" --status || true
+          REMOTE
+
+      - name: What went wrong (only on failure)
+        if: failure()
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" bash -s <<'REMOTE' || true
+          echo "===== journalctl -u chrserver (last 40) ====="
+          sudo -n journalctl -u chrserver -n 40 --no-pager 2>/dev/null || true
+          echo
+          echo "===== journalctl -u cloudflared (last 15) ====="
+          sudo -n journalctl -u cloudflared -n 15 --no-pager 2>/dev/null || true
+          echo
+          echo "===== releases ====="
+          ls -1 /srv/chrserver/releases 2>/dev/null | tail -5 || true
+          REMOTE
+
+      - name: Run summary
+        if: always()
+        run: |
+          {
+            echo "### chrserver → VPS"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`${GITHUB_SHA:0:8}\` |"
+            echo "| bundle | \`${BUNDLE_NAME:-chrserver-*.tgz}\` |"
+            echo "| result | ${{ job.status }} |"
+            echo "| note | ${{ github.event.inputs.release_note }} |"
+            echo ""
+            echo "Roll back: Actions → **Deploy to VPS** → Run workflow → tick *rollback*."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  rollback:
+    name: Roll back to the previous release
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.rollback == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_SSH_KEY_BASE64: ${{ secrets.VPS_SSH_KEY_BASE64 }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_PORT: ${{ env.VPS_PORT }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          if [ -n "${VPS_SSH_KEY_BASE64:-}" ]; then
+            printf '%s' "$VPS_SSH_KEY_BASE64" | base64 -d > ~/.ssh/vps_key
+          else
+            printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/vps_key
+          fi
+          chmod 600 ~/.ssh/vps_key
+          sed -i 's/\r$//' ~/.ssh/vps_key
+          ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "SSH_OPTS=-p ${VPS_PORT} -i ~/.ssh/vps_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" >> "$GITHUB_ENV"
+
+      - name: Roll back on the VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+        run: |
+          set -euo pipefail
+          ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" bash -s <<'REMOTE'
+          set -euo pipefail
+          SUDO=""; [ "$(id -u)" = "0" ] || SUDO="sudo -n"
+          ROOT="/srv/chrserver"
+          $SUDO bash "$ROOT/current/deploy/rollback.sh"
+          $SUDO bash "$ROOT/current/deploy/deploy.sh" --status || true
+          REMOTE

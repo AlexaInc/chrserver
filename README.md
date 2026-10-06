@@ -29,6 +29,7 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
 - [Serving the web app (chrclient web build)](#serving-the-web-app-chrclient-web-build)
 - [Push notifications to the operator's phone](#push-notifications-to-the-operators-phone)
 - [WhatsApp Service](#whatsapp-service)
+- [Deploy to a VPS (CI/CD)](#deploy-to-a-vps-cicd)
 - [Where This Fits in the Overall System](#where-this-fits-in-the-overall-system)
 - [Known Issues / To Do](#known-issues--to-do)
 - [Team](#team)
@@ -163,8 +164,12 @@ You should see:
 
 ```bash
 npm run build      # compiles TypeScript to dist/
-node dist/index.js # run the compiled server
+npm start          # runs node dist/src/index.js
 ```
+
+> `tsc` keeps the folder layout: the entry point is **`dist/src/index.js`** and the
+> database layer is **`dist/db/Sqlight.js`** (`db/` sits outside `src/`, so the
+> project root is the common root). `npm start` is the supported way to run it.
 
 The server listens on **port 8000** and binds to **`0.0.0.0`** by default (see
 `src/index.ts`).
@@ -668,6 +673,54 @@ after a new release a browser refresh is all it takes.
 > fake GitHub API and a real zip: download-once, no-download-when-current,
 > atomic swap, offline fallback, checksum / zip-slip / missing-index guards and
 > the express mount (deep links, cache headers, API paths untouched).
+
+## Deploy to a VPS (CI/CD)
+
+`chrserver` builds on GitHub and deploys itself to your VPS over SSH. Push to `main` (or run the
+**Deploy to VPS** workflow by hand) and the workflow:
+
+1. installs the dependencies and compiles TypeScript,
+2. packs the release (`dist`, `db`, `src`, `deploy`, package files),
+3. copies it to the VPS, writes **`src/config/.env`** from the `ENV_CONTENT` repository secret
+   (Windows CRLF is normalised — a trailing `\r` inside `ADMIN_PASSWORD` would break the login),
+4. installs production dependencies **inside the new release directory**, so the running server is
+   never touched while it is being built,
+5. flips the `current` symlink, restarts the `chrserver` service and waits for **`/health`**,
+6. if the new release does not answer, it **puts the previous release back automatically** and fails
+   the run — the old server keeps serving.
+
+The database, the WhatsApp session, the served web build and the AI model folder live in
+`/srv/chrserver/shared/` and are shared by every release, so a deploy never costs you the WhatsApp
+link or the data.
+
+| piece | where |
+| --- | --- |
+| releases (last 5) | `/srv/chrserver/releases/<timestamp>` |
+| what is serving now | `/srv/chrserver/current` → a release |
+| `.env` (and `src/config/.env`) | `/srv/chrserver/shared/.env` |
+| database | `/srv/chrserver/shared/data/chr.db` |
+| WhatsApp session | `/srv/chrserver/shared/wasession` |
+| served chrclient web build | `/srv/chrserver/shared/public` |
+| AI plant models | `/srv/chrserver/shared/models` |
+
+**One-time setup on the VPS** (Ubuntu/Debian):
+
+```bash
+sudo bash deploy/setup-vps.sh --tunnel-id <CLOUDFLARE-TUNNEL-UUID>
+```
+
+It installs Node 20, the service, and the Cloudflare tunnel, and creates the directories. Then add
+the repository secrets (`VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `ENV_CONTENT` — full list and the
+exact `.env` block, including the tunnel command for the VPS, are in
+[`deploy/README-DEPLOY.md`](deploy/README-DEPLOY.md)) and push.
+
+| command | what it does |
+| --- | --- |
+| `bash deploy/deploy.sh --status` | what is deployed, is `/health` answering, tunnel state |
+| `bash deploy/deploy.sh --rollback` | put the previous release back |
+| `bash deploy/rollback.sh` | same thing, from the repository copy |
+
+---
 
 ## Where This Fits in the Overall System
 

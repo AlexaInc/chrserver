@@ -2,11 +2,13 @@
   "name": "fcp_backend",
   "version": "1.0.0",
   "description": "",
-  "main": "dist/index.js",
+  "main": "dist/src/index.js",
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
-    "devtunnel": "tsx watch src/index.ts --tunnel"
+    "devtunnel": "tsx watch src/index.ts --tunnel",
+    "start": "node dist/src/index.js",
+    "tunnel": "node dist/src/index.js --tunnel"
   },
   "dependencies": {
     "@alexainc/baileys-mod": "github:AlexaInc/baileys-mod",

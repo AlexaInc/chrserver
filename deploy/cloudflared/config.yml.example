@@ -1,0 +1,22 @@
+# ---------------------------------------------------------------------------
+#  Cloudflare Tunnel for chrserver, on the VPS.
+#
+#  This is the same tunnel you run on Windows
+#     "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel ^
+#        --config C:\Users\ASUS\.cloudflared\config.yml run crophelth-tunnel
+#  with Linux paths. Put it at /etc/cloudflared/config.yml
+#
+#  Find the UUID:            cloudflared tunnel list
+#  Copy the credentials:     the <UUID>.json in  %USERPROFILE%\.cloudflared\
+#                            (that file is the tunnel's key — keep it 600)
+# ---------------------------------------------------------------------------
+tunnel: 01234567-89ab-cdef-0123-456789abcdef        # <-- your crophelth-tunnel UUID
+credentials-file: /etc/cloudflared/01234567-89ab-cdef-0123-456789abcdef.json
+
+ingress:
+  # The public name the app and the robot use -> the server on this machine.
+  # Websockets (socket.io) go through the same rule; no extra config needed.
+  - hostname: crophealth.dpdns.org
+    service: http://127.0.0.1:8000
+  # Anything else that reaches the tunnel: clean 404 instead of a hang
+  - service: http_status:404

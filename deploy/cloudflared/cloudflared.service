@@ -1,0 +1,18 @@
+# cloudflared — systemd unit installed by deploy/setup-vps.sh
+[Unit]
+Description=Cloudflare Tunnel (crophelth-tunnel -> chrserver)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The same command as on Windows, with Linux paths
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel --config /etc/cloudflared/config.yml run crophelth-tunnel
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+User=root
+SyslogIdentifier=cloudflared
+
+[Install]
+WantedBy=multi-user.target
