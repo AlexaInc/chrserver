@@ -313,6 +313,99 @@ const socket = io("http://<host>:8000", {
 > CORS for Socket.IO is currently open (`origin: true`) for `GET` and `POST`, suitable for
 > development. Tighten this before any public deployment.
 
+### Robot safety, speed limits & the SD field-map cache
+
+The tables above are historical; the live gateway uses two real events:
+devices send `message.upsert` (`{ Type, Message }`) and the server sends
+`control_command` (`{ command: { action, data } }`) into `esp_32_room` /
+`pump_room`. On top of that:
+
+**Field map — downloaded only when it actually changed**
+
+| Step | Who | What |
+| ---- | --- | ---- |
+| 1 | server | `mapRevision(map)` = sha1 prefix of a key-sorted copy of the stored map, attached as `rev` |
+| 2 | robot | caches the map on its SD card (`/chrhw/fieldmap.json` + `.meta`, temp-file + rename) |
+| 3 | robot → server | `device_hello` event: `{ deviceId, role, firmware, mapRev, mapBlocks, mapBytes, sd, driveSpeedPercent, turnSpeedPercent, sensorAngleLeftDeg, sensorAngleRightDeg, avoidAssist }` |
+| 4 | server | `rev` matches → nothing sent. Mismatch (or no hello within 2.5 s, i.e. older firmware) → `field_map { …map, rev }` |
+| 5 | robot → server | `message.upsert { Type: "map_status", Message: { rev, name, blocks, bytes, sd, path, reason } }` (`saved`, `unchanged`, `save_failed`) |
+
+`save_field_map` recomputes the revision and pushes the new map to the rover
+immediately. `GET /api/status` → `status.fieldMap` reports
+`{ serverRev, robotRev, inSync, blocks, bytes, sd, lastSaveReason }`, which is
+what the app shows as *Field map (SD cache) → IN SYNC / NOT SYNCED*.
+
+**Speed limits — the rover can only ever be made slower**
+
+| Action (server → rover) | Payload | Effect |
+| ---- | ---- | ---- |
+| `motion_config` | `{ driveSpeedPercent, turnSpeedPercent, sensorAngleLeftDeg, sensorAngleRightDeg, avoidAssist }` (speeds 0-100, angles 0-80) | applies + stores on SD; pushed on every connect and on every settings save |
+| `set_speed` | `{ percent }` or `{ driveSpeedPercent, turnSpeedPercent, sensorAngleLeftDeg, sensorAngleRightDeg, avoidAssist }` | convenience form, clamped server-side (`clampPercent` / `clampAngle`) |
+| `get_motion_status` | — | rover answers with `motion_config` |
+| `get_map_status` | — | rover answers with `map_status` |
+
+`FleetConfig` gained `driveSpeedPercent` (default **70**), `turnSpeedPercent`
+(default **65**), `sensorAngleLeftDeg` / `sensorAngleRightDeg` (default
+**45°** — the printed side brackets) and `avoidAssist` (default **true**);
+`apply_config` stores and forwards all of them. 100 % equals the firmware's own
+safe cruise PWM (110 of 255 duty) and `MOTION_HARD_MAX_PWM` (150) is a
+compile-time ceiling, so a panel value can never make the rover run away. The
+angles are how the rover knows where its side beams point: the firmware converts
+each side reading into `reading x sin(angle + cone/2)` before it calls a gap
+passable, so a re-bolted bracket only needs the number changed.
+
+**Front-arc avoidance — going AROUND a plant is reported as a manoeuvre, not a stop**
+
+The rover steers to the wider side, creeps past at crawl speed and returns to
+the mission heading; it only stops when neither side gap is wider than the
+chassis (`no-path`) or something is inside the emergency ring. The gateway just
+carries that honestly:
+
+| `motion_config.reason` | Meaning | Alert |
+| ---- | ---- | ---- |
+| `applied` / `unchanged` / `requested` | config ack | — |
+| `avoiding` | steering to the wider side (payload has `avoidState`, `avoidDir`, `gapLeftCm`, `gapRightCm`, `frontCm`, `blockedBy`: `plant-left` / `plant-right` / `plant-ahead`) | info |
+| `creep` | turned enough, driving past the plant at crawl speed | info |
+| `turn-back` / `clear` | swinging back onto the heading / back to normal | — |
+| `no-path` | **stopped**: no side gap wide enough to pass | warning |
+| `emergency` | something inside the emergency ring | warning |
+| `obstacle` | safety-distance stop with the assist switched off | info |
+| `failsafe` | no fresh drive command arrived | warning |
+
+State changes only — the firmware never reports once per scan, so an avoiding
+manoeuvre produces one info alert, not a stream. `RobotStatus.motion` carries
+the same fields (`avoidState`, `avoidDir`, `gapLeftCm`, `gapRightCm`, `frontCm`,
+`sensorAngleLeftDeg`, `sensorAngleRightDeg`, `avoidAssist`) next to the PWM
+values, which is what the app's Controller screen renders as
+*"Going around a plant — steering right (26 cm ahead · gaps 20 cm left /
+48 cm right)"*.
+
+**Safety telemetry**
+
+The rover acks every speed change and reports self-protection events as
+`message.upsert { Type: "motion_config" }` with `reason: "applied" | "obstacle" |
+"failsafe" | "unchanged"`, plus the live `appliedPwm`, `intent`, `source`,
+`blockedBy` and `obstacleStopCm`. `RobotStatus.motion` exposes them next to the
+operator's configured limits, an obstacle stop raises an *info* alert and a
+dead-man failsafe cut raises a *warning* alert, so the operator learns why the
+rover stopped instead of guessing.
+
+> Regression suite (the two files are in this repository):
+>
+> ```bash
+> npm i --no-save socket.io-client      # test-only dependency, not shipped
+> npx tsx chrserver-verify-safety.ts    # 30 checks: robot safety / map / arc
+> npx tsx chrserver-verify-whatsapp.ts  # 25 checks: WhatsApp link / commands / footer
+> ```
+>
+> Both boot the real gateway against a temporary SQLite file and talk to it with
+> fake sockets — no robot, no pump and no WhatsApp account needed.
+>
+> `npx tsx chrserver-verify-safety.ts` — 30 checks covering
+> the revision handshake, the legacy path, clamping (speeds **and** angles),
+> forwarding, the avoidance/manoeuvre alerts, and the status payload, with no
+> hardware and no WhatsApp connection needed.
+
 ---
 
 ## WhatsApp Service

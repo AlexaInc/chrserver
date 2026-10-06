@@ -241,7 +241,12 @@ export class Server {
         /* ---------------------------------------------------------------- */
 
         this.app.get("/api/config", this.authorizeClient, async (_req, res, next) => {
-            try { res.send({ ok: true, config: await this.db.getSetting<FleetConfig>("fleetConfig", DEFAULT_FLEET_CONFIG) }); } catch (e) { next(e); }
+            try {
+                // Always answer with the complete shape: a config record saved
+                // before the speed limits existed must not surface as undefined.
+                const stored = await this.db.getSetting<Partial<FleetConfig>>("fleetConfig", {});
+                res.send({ ok: true, config: { ...DEFAULT_FLEET_CONFIG, ...stored } });
+            } catch (e) { next(e); }
         });
 
         /* ---------------------------------------------------------------- */
