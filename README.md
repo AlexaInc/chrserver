@@ -25,10 +25,7 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
 - [Available Scripts](#available-scripts)
 - [REST API Reference](#rest-api-reference)
 - [Real-Time (Socket.IO) API](#real-time-socketio-api)
-<<<<<<< ours
-=======
 - [Operator safety, owner numbers & per-well moisture](#operator-safety-owner-numbers--per-well-moisture)
->>>>>>> theirs
 - [Serving the web app (chrclient web build)](#serving-the-web-app-chrclient-web-build)
 - [WhatsApp Service](#whatsapp-service)
 - [Where This Fits in the Overall System](#where-this-fits-in-the-overall-system)
@@ -505,8 +502,6 @@ Optional environment variables:
 
 ---
 
-<<<<<<< ours
-=======
 ## Operator safety, owner numbers & per-well moisture
 
 ### Rain and fuel — the server reacts, it does not just report
@@ -562,7 +557,6 @@ npx tsx chrserver-verify-task7.ts   # rain/fuel safety, owner numbers, threshold
 
 ---
 
->>>>>>> theirs
 ## Serving the web app (chrclient web build)
 
 `AlexaInc/chrserver` also publishes the **web version of the dashboard**, so
