@@ -54,7 +54,7 @@ import { Boom } from '@hapi/boom';
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger as rootLogger } from "../logger";
-import { CHRDatabase } from "../../db/Sqlight";
+import { CHRDatabase, MAX_OWNER_NUMBERS } from "../../db/Sqlight";
 import { FieldMapMessage, WSServer } from "../sockets/wsserver";
 import { AutonomousMission } from "./MissionPlanner";
 
@@ -95,6 +95,10 @@ type ButtonReply = {
  * become `94766045156`. Local formats (`0766045156`) are rejected because a
  * missing country code makes the bot silently unreachable.
  */
+/** Shown whenever a number is unusable (kept in one place so bot + app agree). */
+export const NO_NUMBER_HINT =
+    "Send the number with its country code, digits only — e.g. 94766045156 (local formats like 0766045156 are rejected)";
+
 export function normalizeWhatsAppNumber(raw: string | null | undefined): string | null {
     if (!raw) return null;
     let digits = String(raw).trim().replace(/[^\d]/g, "");
@@ -186,7 +190,10 @@ export type SessionHealth = "active" | "inactive" | "invalid" | "not_linked";
 export interface WhatsAppStatus {
     state: WhatsAppState;
     enabled: boolean;
+    /** primary owner number — first entry of `ownerNumbers` */
     ownerNumber: string | null;
+    /** every number allowed to command the robot and receive the alerts */
+    ownerNumbers: string[];
     linkedNumber: string | null;
     linkedAt: number | null;
     sessionExists: boolean;
@@ -321,6 +328,7 @@ export class WhatsAppService {
             state: this.waState,
             enabled: settings.enabled,
             ownerNumber: settings.ownerNumber,
+            ownerNumbers: settings.ownerNumbers,
             linkedNumber: settings.linkedNumber,
             linkedAt: settings.linkedAt,
             sessionExists,
@@ -627,22 +635,131 @@ export class WhatsAppService {
         return this.getStatus();
     }
 
-    /** Only change the owner gate number — never touches the session. */
+    /**
+     * Replace the owner list with a single number (the original
+     * "owner number" route/UI keeps working exactly as before, it just becomes
+     * a one-element list).
+     */
     public async setOwnerNumber(rawNumber: string): Promise<WhatsAppStatus> {
         const number = normalizeWhatsAppNumber(rawNumber);
-        if (!number) {
-            throw new Error("Enter the owner number with its country code and digits only (example: 94766045156)");
-        }
-        await this.requireDb().saveWhatsAppSettings({ ownerNumber: number, ownerLids: [] });
+        if (!number) throw new Error(NO_NUMBER_HINT);
+        await this.requireDb().setOwnerNumbers([number]);
         return this.getStatus();
+    }
+
+    /**
+     * Add one more number to the owner list (Settings → "Add another number").
+     * Every entry can command the robot and receives the alerts; the cap keeps a
+     * farm from turning the bot into an open control channel.
+     */
+    public async addOwnerNumber(rawNumber: string): Promise<WhatsAppStatus> {
+        const number = normalizeWhatsAppNumber(rawNumber);
+        if (!number) throw new Error(NO_NUMBER_HINT);
+        const settings = await this.requireDb().getWhatsAppSettings();
+        if (settings.ownerNumbers.includes(number)) {
+            throw new Error(`${number} is already an owner number`);
+        }
+        if (settings.ownerNumbers.length >= MAX_OWNER_NUMBERS) {
+            throw new Error(`The owner list is full (maximum ${MAX_OWNER_NUMBERS} numbers) — remove one first`);
+        }
+        await this.requireDb().setOwnerNumbers([...settings.ownerNumbers, number]);
+        this.logger.info(`Owner number added: ${number} (${settings.ownerNumbers.length + 1}/${MAX_OWNER_NUMBERS})`);
+        return this.getStatus();
+    }
+
+    /** Remove one number; the list may never become empty. */
+    public async removeOwnerNumber(rawNumber: string): Promise<WhatsAppStatus> {
+        const number = normalizeWhatsAppNumber(rawNumber);
+        if (!number) throw new Error(NO_NUMBER_HINT);
+        const settings = await this.requireDb().getWhatsAppSettings();
+        if (!settings.ownerNumbers.includes(number)) throw new Error(`${number} is not in the owner list`);
+        if (settings.ownerNumbers.length <= 1) {
+            throw new Error("At least one owner number must stay in the list — set a new one first");
+        }
+        await this.requireDb().setOwnerNumbers(settings.ownerNumbers.filter((n) => n !== number));
+        this.logger.warn(`Owner number removed: ${number}`);
+        return this.getStatus();
+    }
+
+    /** Replace the whole list at once (used by the dashboard's save-all path). */
+    public async setOwnerNumbers(rawNumbers: string[]): Promise<WhatsAppStatus> {
+        const numbers: string[] = [];
+        for (const raw of rawNumbers ?? []) {
+            const number = normalizeWhatsAppNumber(raw);
+            if (!number) throw new Error(`${raw}: ${NO_NUMBER_HINT}`);
+            if (!numbers.includes(number)) numbers.push(number);
+        }
+        if (numbers.length === 0) throw new Error("Keep at least one owner number");
+        if (numbers.length > MAX_OWNER_NUMBERS) throw new Error(`Maximum ${MAX_OWNER_NUMBERS} owner numbers`);
+        await this.requireDb().setOwnerNumbers(numbers);
+        return this.getStatus();
+    }
+
+    /** The saved owner list, ready to send to. */
+    public async ownerNumbers(): Promise<string[]> {
+        return (await this.requireDb().getWhatsAppSettings()).ownerNumbers;
+    }
+
+    /**
+     * Send the same card to EVERY owner number — this is how rain, petrol-empty
+     * and other safety alerts reach the whole family instead of one phone that
+     * may be in a pocket. Never throws: one unreachable number must not stop the
+     * others from being told.
+     */
+    public async notifyOwners(
+        text: string,
+        options: { title?: string; buttons?: WhatsAppButton[][]; fallbackHint?: string } = {},
+    ): Promise<{ sent: string[]; failed: string[] }> {
+        const numbers = await this.ownerNumbers();
+        const sent: string[] = [];
+        const failed: string[] = [];
+        if (!this.WaSocket?.user) {
+            this.logger.warn("Owner alert not sent: WhatsApp is not connected");
+            return { sent, failed: numbers };
+        }
+        for (const number of numbers) {
+            const jid = numberToJid(number);
+            try {
+                const rows = (options.buttons ?? []).flat().slice(0, 3);
+                if (rows.length) {
+                    await this.sendInteractive(jid, {
+                        title: options.title ?? "AI Crop Robot",
+                        text,
+                        buttons: rows,
+                        fallbackHint: options.fallbackHint,
+                    });
+                } else {
+                    await this.sendInteractive(jid, {
+                        title: options.title ?? "AI Crop Robot",
+                        text,
+                        buttons: await this.contextButtons(3),
+                        fallbackHint: options.fallbackHint,
+                    });
+                }
+                sent.push(number);
+            } catch (error: any) {
+                failed.push(number);
+                this.logger.warn({ error }, `Owner alert failed for ${number}`);
+            }
+        }
+        return { sent, failed };
     }
 
     /** Send a confirmation message to the owner (Settings → "Send test message"). */
     public async sendTestMessage(): Promise<WhatsAppStatus> {
         const settings = await this.requireDb().getWhatsAppSettings();
         if (!this.WaSocket?.user) throw new Error("WhatsApp is not connected yet");
-        if (!settings.ownerNumber) throw new Error("Set the owner number first");
-        await this.sendText(numberToJid(settings.ownerNumber), "✅ *chrserver WhatsApp service is connected.*\nSend *.menu* to see the available commands.");
+        if (!settings.ownerNumbers.length) throw new Error("Add an owner number first");
+        const line = (n: string, i: number) => `${i === 0 ? "•" : "•"} ${n}${i === 0 ? " (primary)" : ""}`;
+        const result = await this.notifyOwners(
+            `✅ *chrserver WhatsApp service is connected.*\nThis test message went to all ${settings.ownerNumbers.length} owner number(s):\n` +
+                settings.ownerNumbers.map(line).join("\n") +
+                "\n\nSend *.menu* to see the available commands.",
+            { title: "Test message" },
+        );
+        if (result.failed.length && !result.sent.length) {
+            throw new Error(`Could not reach any owner number (${result.failed.join(", ")})`);
+        }
         return this.getStatus();
     }
 
@@ -811,10 +928,10 @@ export class WhatsAppService {
 
     private async isOwner(p: ParsedMessage): Promise<boolean> {
         const settings = await this.requireDb().getWhatsAppSettings();
-        if (!settings.ownerNumber) return false;
+        if (!settings.ownerNumbers.length) return false;
 
         const numbers = [p.senderNumber, jidToNumber(p.senderJid), jidToNumber(p.senderlid)];
-        if (numbers.some((n) => n && n === settings.ownerNumber)) {
+        if (numbers.some((n) => n && settings.ownerNumbers.includes(n))) {
             // Learn the owner's LID (WhatsApp's phone-number-hiding alias) so
             // the gate keeps working on chats that only expose `@lid`.
             if (isLid(p.senderlid) && p.senderlid && !settings.ownerLids.includes(p.senderlid)) {
@@ -1092,8 +1209,14 @@ export class WhatsAppService {
                 return this.sendSession(jid, quoted);
             case "bot": case "service":
                 return this.botCommand(args, jid, quoted);
-            case "owner":
+            case "owner": case "owners":
                 return this.ownerCommand(args, jid, quoted);
+            case "rain":
+                return this.rainCommand(args, jid, quoted);
+            case "fuel": case "petrol":
+                return this.fuelCommand(args, jid, quoted);
+            case "safety":
+                return this.sendSafety(jid, quoted);
             case "whoami":
                 return this.sendText(jid, `🆔 *Your identifiers*\n• phone: ${p.senderNumber || "hidden (lid only)"}\n• jid: ${p.senderJid ?? "-"}\n• lid: ${p.senderlid ?? "-"}`, quoted);
             case "stop":
@@ -1128,6 +1251,14 @@ Owner-only. Tap a button, or type the command.
 • .pump — pump control buttons
 • .pump_on 60 • .pump_off
 • .pump_auto on|off • .pump_status
+• .pump threshold 40 — every well (.pump threshold 40 <pumpId> — one well)
+
+*🛟 Safety*
+• .rain — I see rain: pump off, robot home, owners alerted
+• .rain clear — sensor is dry, release the pump lock
+• .fuel — report an empty petrol tank
+• .fuel refilled — tank filled again
+• .safety — rain lock + petrol state + owner list
 
 *📊 Farm data*
 • .telemetry • .alerts • .reports • .blocks
@@ -1135,7 +1266,7 @@ Owner-only. Tap a button, or type the command.
 *⚙️ Account*
 • .bot on|off — start/stop this bot
 • .session — link + session health
-• .owner — owner number
+• .owner — owner numbers (add / remove, up to 10)
 • .whoami — your WhatsApp ids`;
 
         await this.sendInteractive(jid, {
@@ -1433,7 +1564,18 @@ Owner-only. Tap a button, or type the command.
         switch (action) {
             case "on": case "start": {
                 const seconds = Math.max(1, Math.min(3600, Number(value) || 60));
-                return this.pumpAction(jid, "pump_on", { durationSeconds: seconds }, quoted, `🚿 *Pump ON for ${seconds}s.*`);
+                // `.pump_on 60 force` overrides the rain lock deliberately — the
+                // lock exists so rain cannot be ignored by accident, not so the
+                // operator can be locked out of their own pump.
+                const forceRain = /\bforce\b/i.test(args);
+                const safety = await this.getWs()?.getSafetyState();
+                if (safety?.pumpLocked && !forceRain) {
+                    return this.sendText(jid,
+                        `🌧️ *Rain lock is active* — the pump stays OFF while rain is being detected.\n` +
+                        `Wait for the sensor to dry out, send \`.rain clear\` once it is dry, or override on purpose with \`.pump_on ${seconds} force\`.`, quoted);
+                }
+                return this.pumpAction(jid, "pump_on", { durationSeconds: seconds, forceRain }, quoted,
+                    `🚿 *Pump ON for ${seconds}s.*${safety?.pumpLocked ? "\n⚠️ Rain lock overridden by request." : ""}`);
             }
             case "off": case "stop":
                 return this.pumpAction(jid, "pump_off", undefined, quoted, "🛑 *Pump OFF.*");
@@ -1448,12 +1590,21 @@ Owner-only. Tap a button, or type the command.
                     : "🚿 No pump reading stored yet.", quoted);
             }
             case "threshold": {
+                // `.pump threshold 40 [pumpId|blockId]` — the probe lives on the
+                // pump, so the threshold is stored per well; without an id it is
+                // the fleet-wide value every well falls back to.
+                const wellId = args.split(/\s+/)[2];
                 const percent = Math.max(5, Math.min(90, Number(value) || 35));
                 await this.requireDb().setSetting("fleetConfig", {
                     ...(await this.getWs()?.getFleetConfig() ?? {}),
                     irrigationThresholdPercent: percent,
                 });
-                return this.pumpAction(jid, "set_irrigation_threshold", { moisturePercent: percent }, quoted, `💧 *Irrigation threshold set to ${percent}%.*`);
+                return this.pumpAction(jid, "set_irrigation_threshold",
+                    wellId ? { moisturePercent: percent, pumpId: wellId } : { moisturePercent: percent },
+                    quoted,
+                    wellId
+                        ? `💧 *${wellId}* now waters automatically below *${percent}%* soil moisture.`
+                        : `💧 *Irrigation threshold set to ${percent}%* for every well that has no value of its own.`);
             }
             case "irrigate": {
                 if (!value) return this.sendText(jid, "Usage: `.pump irrigate <blockId> [seconds]`", quoted);
@@ -1463,6 +1614,85 @@ Owner-only. Tap a button, or type the command.
             default:
                 return this.sendText(jid, `❓ Unknown pump sub-command *${sub}*.\nTry: .pump · .pump_on 60 · .pump_off · .pump_auto on|off · .pump_status · .pump_stop`, quoted);
         }
+    }
+
+    /* ---------------------------------------------------------------- */
+    /* Rain + petrol safety                                              */
+    /* ---------------------------------------------------------------- */
+
+    /** `.rain [clear]` — report rain (runs the pump-off / return-to-base sequence)
+     *  or, with the sensor dry again, release the pump lock. */
+    private async rainCommand(args: string, jid: string, quoted: WAMessage): Promise<void> {
+        const ws = this.getWs();
+        if (!ws) return this.sendText(jid, "⚠️ The robot link is not up yet — try again in a moment.", quoted);
+        const sub = args.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+        if (sub === "clear" || sub === "stop" || sub === "dry") {
+            await ws.clearRain(null, "operator");
+            return this.sendText(jid, "🌤️ *Rain lock released.* Auto irrigation stays OFF until you switch it on again (`.pump_auto on`).", quoted, await this.contextButtons(3));
+        }
+        const state = await ws.getSafetyState();
+        const ack = await ws.runRainSequence("operator", state.lastRainPercent ?? undefined, "whatsapp");
+        await this.sendRobotResult(jid, ack.success,
+            ack.success
+                ? `🌧️ *Rain sequence run.*\n• water pump: OFF and locked off while it rains\n• robot: sent back to its base point\n• every owner number has been alerted\n\nWhen the sensor is dry again send \`.rain clear\` (or switch it from the dashboard) to release the pump lock.`
+                : `⚠️ ${ack.reason ?? "Could not run the rain sequence"}`,
+            quoted, await this.pumpRow(3));
+    }
+
+    /** `.fuel [refilled]` — the petrol-empty report / closing it again. */
+    private async fuelCommand(args: string, jid: string, quoted: WAMessage): Promise<void> {
+        const ws = this.getWs();
+        if (!ws) return this.sendText(jid, "⚠️ The robot link is not up yet — try again in a moment.", quoted);
+        const sub = args.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+        if (["refilled", "full", "clear", "filled"].includes(sub)) {
+            const ack = await ws.clearFuelEmpty("whatsapp");
+            return this.sendText(jid, ack.success
+                ? "⛽ *Refuelled.* The petrol-empty report is closed, missions can be deployed again."
+                : `ℹ️ ${ack.reason ?? "Nothing to close"}`, quoted, await this.contextButtons(3));
+        }
+        if (["empty", "report", "out", "runout"].includes(sub) || sub === "") {
+            // `sub === ""` → .fuel with no argument reports the empty tank
+            if (sub === "") {
+                const state = await ws.getSafetyState();
+                if (state.fuelEmpty) {
+                    return this.sendText(jid, `⛽ A petrol-empty report is already open (${timeAgo(state.fuelEmptyAt ?? 0)}). Send \`.fuel refilled\` once the tank is filled.`, quoted);
+                }
+            }
+            const ack = await ws.reportFuelEmpty({ note: "reported from WhatsApp" }, "whatsapp");
+            return this.sendRobotResult(jid, ack.success,
+                ack.success
+                    ? "⛽ *Petrol-empty report sent to every owner number*, together with the last known position. Missions are blocked until the tank is refilled (`.fuel refilled`)."
+                    : `⚠️ ${ack.reason ?? "Could not send the report"}`,
+                quoted, await this.contextButtons(3));
+        }
+        return this.sendText(jid, "Usage: `.fuel` (report an empty tank) · `.fuel refilled` (close the report) · `.safety` (safety state)", quoted);
+    }
+
+    /** `.safety` — rain lock + petrol state + owner list, in one card. */
+    private async sendSafety(jid: string, quoted: WAMessage): Promise<void> {
+        const ws = this.getWs();
+        const state = ws ? await ws.getSafetyState() : null;
+        const settings = await this.requireDb().getWhatsAppSettings();
+        const text = [
+            "🛟 *Safety state*",
+            state
+                ? `• rain: ${state.raining ? `*DETECTED* (${state.lastRainPercent != null ? `${Math.round(state.lastRainPercent)}% ` : ""}via ${state.lastRainSource ?? "?"}, ${timeAgo(state.rainStartedAt ?? 0)})` : "dry"}`
+                : "• rain: robot link not up yet",
+            state ? `• pump lock: *${state.pumpLocked ? "ON (pump cannot start)" : "off"}*` : "",
+            state ? `• petrol: ${state.fuelEmpty ? `*EMPTY* (reported ${timeAgo(state.fuelEmptyAt ?? 0)})` : "ok"}` : "",
+            state?.returnToBaseAt ? `• last return-to-base: ${timeAgo(state.returnToBaseAt)}` : "",
+            `• owner numbers (${settings.ownerNumbers.length}/10): ${settings.ownerNumbers.join(", ") || "not set"}`,
+            "",
+            "`.rain` — I see rain, run the sequence · `.rain clear` — sensor is dry",
+            "`.fuel` — petrol empty · `.fuel refilled` — tank filled",
+        ].filter(Boolean).join("\n");
+        await this.sendInteractive(jid, {
+            title: "Safety",
+            text,
+            quoted,
+            buttons: await this.contextButtons(3),
+            fallbackHint: "Commands: .rain · .fuel · .safety · .owner",
+        });
     }
 
     /* ---------------------------------------------------------------- */
@@ -1572,15 +1802,63 @@ Owner-only. Tap a button, or type the command.
         });
     }
 
+    /**
+     * `.owner` — the owner list from chat.
+     *
+     *   .owner                    list every number (+ how many of the 10 are used)
+     *   .owner add 94XXXXXXXXX    add one more number
+     *   .owner remove 94XXXXXXXXX remove one (never the last one)
+     *   .owner set 94XXXXXXXXX    start the list over with a single number
+     */
     private async ownerCommand(args: string, jid: string, quoted: WAMessage): Promise<void> {
         const [sub = "", value = ""] = args.split(/\s+/).filter(Boolean);
-        if (sub.toLowerCase() === "set") {
-            const number = normalizeWhatsAppNumber(value);
-            if (!number) return this.sendText(jid, "❌ Send the number with its country code, digits only — e.g. `.owner set 94766045156`\n(Local formats like 0766045156 are rejected.)", quoted);
-            await this.setOwnerNumber(number);
-            return this.sendText(jid, `✅ Owner number saved: *${number}*\nOnly this number can control the robot from now on.`, quoted);
-        }
+        const action = sub.toLowerCase();
         const settings = await this.requireDb().getWhatsAppSettings();
-        await this.sendText(jid, `👤 *Owner number:* ${settings.ownerNumber ?? "not set"}\n${settings.ownerLids.length ? `• learned LIDs: ${settings.ownerLids.length}` : ""}\nChange it with \`.owner set 94XXXXXXXXX\` or from the dashboard's Settings → WhatsApp Service page.`, quoted);
+        const listText = settings.ownerNumbers.length
+            ? settings.ownerNumbers.map((n, i) => `${i === 0 ? "1️⃣" : `${i + 1}.`} ${n}${i === 0 ? " (primary)" : ""}`).join("\n")
+            : "not set";
+
+        if (action === "add") {
+            const number = normalizeWhatsAppNumber(value);
+            if (!number) return this.sendText(jid, `❌ ${NO_NUMBER_HINT}\nExample: \`.owner add 94766045156\``, quoted);
+            try {
+                await this.addOwnerNumber(number);
+            } catch (error: any) {
+                return this.sendText(jid, `❌ ${error?.message ?? "Could not add that number"}`, quoted);
+            }
+            const after = (await this.requireDb().getWhatsAppSettings()).ownerNumbers;
+            await this.sendText(jid, `✅ *${number}* added.\nThe bot now accepts commands from ${after.length}/${MAX_OWNER_NUMBERS} owner numbers and sends alerts to all of them.`, quoted, await this.contextButtons(3));
+            return;
+        }
+
+        if (action === "remove" || action === "delete") {
+            const number = normalizeWhatsAppNumber(value);
+            if (!number) return this.sendText(jid, `❌ Send the number to remove, e.g. \`.owner remove 94766045156\``, quoted);
+            try {
+                await this.removeOwnerNumber(number);
+            } catch (error: any) {
+                return this.sendText(jid, `❌ ${error?.message ?? "Could not remove that number"}`, quoted);
+            }
+            await this.sendText(jid, `🗑️ *${number}* removed — it can no longer command the robot and stops receiving alerts.`, quoted);
+            return;
+        }
+
+        if (action === "set") {
+            const number = normalizeWhatsAppNumber(value);
+            if (!number) return this.sendText(jid, `❌ ${NO_NUMBER_HINT}\nExample: \`.owner set 94766045156\``, quoted);
+            await this.setOwnerNumber(number);
+            return this.sendText(jid, `✅ Owner list replaced with *${number}*.\nAdd more with \`.owner add <number>\` (up to ${MAX_OWNER_NUMBERS}).`, quoted);
+        }
+
+        await this.sendText(jid, [
+            `👤 *Owner numbers (${settings.ownerNumbers.length}/${MAX_OWNER_NUMBERS})*`,
+            listText,
+            settings.ownerLids.length ? `• learned LIDs: ${settings.ownerLids.length}` : "",
+            "",
+            "`.owner add 94XXXXXXXXX` — add another number",
+            "`.owner remove 94XXXXXXXXX` — remove one",
+            "`.owner set 94XXXXXXXXX` — start over with one number",
+            "All of them can command the robot and every one of them receives the rain / petrol alerts.",
+        ].filter(Boolean).join("\n"), quoted);
     }
 }

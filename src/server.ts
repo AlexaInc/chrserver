@@ -298,7 +298,69 @@ export class Server {
                     status: await ws.computeStatus(),
                     alerts: { unacknowledged: unacknowledgedAlerts, recent: recentAlerts },
                     recentPatrols,
+                    safety: await ws.getSafetyState(),
+                    wellThresholds: await this.db.getSetting<Record<string, number>>("wellThresholds", {}),
                 });
+            } catch (e) { next(e); }
+        });
+
+        /**
+         * Rain / petrol safety state + the two manual reports.
+         *
+         * The app shows this on the Robot screen; the operator can also start the
+         * sequence by hand ("I see rain") or report an empty tank, which is then
+         * forwarded to every saved owner number.
+         */
+        this.app.get("/api/safety", this.authorizeClient, async (_req, res, next) => {
+            try {
+                const ws = WSServer.getInstance();
+                res.send({
+                    ok: true,
+                    safety: await ws.getSafetyState(),
+                    wellThresholds: await this.db.getSetting<Record<string, number>>("wellThresholds", {}),
+                    rainThresholdPercent: Number(process.env.RAIN_THRESHOLD_PERCENT ?? 60),
+                    owners: (await WhatsAppService.getInstance(logger, this.db).getStatus()).ownerNumbers,
+                });
+            } catch (e) { next(e); }
+        });
+
+        this.app.post("/api/safety/rain", this.authorizeClient, async (req, res, next) => {
+            try {
+                const ack = await WSServer.getInstance().runRainSequence(
+                    "operator", Number(req.body?.rainPercent), "dashboard");
+                res.send({ ok: ack.success, ack, safety: await WSServer.getInstance().getSafetyState() });
+            } catch (e) { next(e); }
+        });
+
+        this.app.post("/api/safety/fuel-empty", this.authorizeClient, async (req, res, next) => {
+            try {
+                const ack = await WSServer.getInstance().reportFuelEmpty({
+                    note: req.body?.note, runMinutes: Number(req.body?.runMinutes) || undefined,
+                }, "dashboard");
+                res.send({ ok: ack.success, ack, safety: await WSServer.getInstance().getSafetyState() });
+            } catch (e) { next(e); }
+        });
+
+        this.app.post("/api/safety/fuel-refilled", this.authorizeClient, async (_req, res, next) => {
+            try {
+                const ack = await WSServer.getInstance().clearFuelEmpty("dashboard");
+                res.send({ ok: ack.success, ack, safety: await WSServer.getInstance().getSafetyState() });
+            } catch (e) { next(e); }
+        });
+
+        /**
+         * Self-update feed for the app.
+         *
+         * The app asks its own server (which can hold a GitHub token and cache the
+         * answer) instead of hammering the public GitHub API from every phone. The
+         * reply carries the newest release AND the web build this server is
+         * currently serving, so the web app knows whether a reload is enough.
+         */
+        this.app.get("/api/app/release", async (_req, res, next) => {
+            try {
+                const release = await WSServer.getInstance().getLatestReleaseInfo();
+                const status = WebAppRelease.getInstance().getStatus();
+                res.send({ ok: true, ...release, servedTag: status.tag ?? null, served: status.serving });
             } catch (e) { next(e); }
         });
 
@@ -459,6 +521,38 @@ export class Server {
                 const status = await WhatsAppService.getInstance(logger, this.db).setOwnerNumber(number);
                 res.send({ ok: true, ...status });
             } catch (e) { next(e); }
+        });
+
+        /* ---- owner number LIST (max 10, saved in the DB, all alerted) ---- */
+
+        this.app.post("/api/whatsapp/owners", this.authorizeClient, async (req, res, next) => {
+            try {
+                const status = await WhatsAppService.getInstance(logger, this.db)
+                    .addOwnerNumber(String(req.body?.number ?? ""));
+                res.send({ ok: true, ...status });
+            } catch (e: any) {
+                res.status(400).send({ ok: false, message: e?.message ?? "Could not add that number" });
+            }
+        });
+
+        this.app.post("/api/whatsapp/owners/remove", this.authorizeClient, async (req, res, next) => {
+            try {
+                const status = await WhatsAppService.getInstance(logger, this.db)
+                    .removeOwnerNumber(String(req.body?.number ?? ""));
+                res.send({ ok: true, ...status });
+            } catch (e: any) {
+                res.status(400).send({ ok: false, message: e?.message ?? "Could not remove that number" });
+            }
+        });
+
+        this.app.post("/api/whatsapp/owners/set", this.authorizeClient, async (req, res, next) => {
+            try {
+                const numbers = Array.isArray(req.body?.numbers) ? req.body.numbers.map(String) : [];
+                const status = await WhatsAppService.getInstance(logger, this.db).setOwnerNumbers(numbers);
+                res.send({ ok: true, ...status });
+            } catch (e: any) {
+                res.status(400).send({ ok: false, message: e?.message ?? "Could not save the owner numbers" });
+            }
         });
 
         this.app.post("/api/whatsapp/test", this.authorizeClient, async (_req, res, next) => {

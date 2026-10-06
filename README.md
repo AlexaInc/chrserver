@@ -25,6 +25,10 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
 - [Available Scripts](#available-scripts)
 - [REST API Reference](#rest-api-reference)
 - [Real-Time (Socket.IO) API](#real-time-socketio-api)
+<<<<<<< ours
+=======
+- [Operator safety, owner numbers & per-well moisture](#operator-safety-owner-numbers--per-well-moisture)
+>>>>>>> theirs
 - [Serving the web app (chrclient web build)](#serving-the-web-app-chrclient-web-build)
 - [WhatsApp Service](#whatsapp-service)
 - [Where This Fits in the Overall System](#where-this-fits-in-the-overall-system)
@@ -473,6 +477,10 @@ the number you paired, and it can be changed at any time in the app or with `.ow
 | `.alerts` · `.reports` · `.blocks`                   | last alerts · latest analysis report · field blocks             |
 | `.bot on\|off`                                        | start/stop this WhatsApp service (session is kept when off)     |
 | `.session` · `.owner` · `.owner set 94XXXXXXXXX`      | bot + session health · owner number                             |
+| `.owners` / `.owners add\|remove 94XXXXXXXXX`         | **all** owner numbers (up to 10, stored in the DB)              |
+| `.pump threshold 40 \[pumpId\]`                      | moisture threshold for one well (or the whole farm)              |
+| `.rain` / `.rain clear` · `.fuel` / `.fuel refilled`  | rain latch · tank-empty report (and clearing it)                 |
+| `.safety`                                            | rain latch, tank state, well thresholds at a glance              |
 
 Replies are native-flow interactive messages whose buttons are **derived from the live state**
 (`pumpButtons()` / `missionButtons()` in `WhatsAppService.ts`): while the pump runs you are
@@ -497,6 +505,64 @@ Optional environment variables:
 
 ---
 
+<<<<<<< ours
+=======
+## Operator safety, owner numbers & per-well moisture
+
+### Rain and fuel — the server reacts, it does not just report
+
+| Trigger (app, robot or WhatsApp) | What chrserver does |
+| --- | --- |
+| rain drop detected — `report_rain` / `.rain` | **pump OFF**, `return_to_base` sent to the rover, every owner number alerted, the rain latch is set |
+| rain cleared — `rain_clear` / `.rain clear` | latch released, auto-irrigation is allowed again |
+| tank empty — `report_fuel_empty` / `.fuel` | owners get the fuel report (run minutes + note), `deploy_mission` is refused until refilled |
+| refilled — `fuel_refilled` / `.fuel refilled` | missions are allowed again |
+
+The rain decision uses `RAIN_THRESHOLD_PERCENT` (default **60 %**) with 15 % hysteresis, and a
+`RAIN_SEQUENCE_THROTTLE_MS` (5 min) throttle so one shower cannot turn into a storm of
+messages. Repeat alerts do not stack: `raiseAlert` supersedes the previous one with the same
+title (`db.acknowledgeSuperseded`). The whole state is kept in `safetyState` and reported by
+`GET /api/safety`; `POST /api/safety/rain`, `/api/safety/fuel-empty` and `/api/safety/fuel-refilled`
+drive it from outside the socket.
+
+### Owner numbers — up to ten, in the database
+
+`ownerNumbers: string[]` replaces the old single number (a stored single number is migrated on
+read), duplicates are dropped, and the list can hold at most `MAX_OWNER_NUMBERS = 10` and can
+never be emptied from the app. `.owners` lists them, `.owners add|remove <number>` (or
+`.owners set a,b,c`) edits them from chat, and the app uses
+`POST /api/whatsapp/owners` / `/api/whatsapp/owners/remove` / `/api/whatsapp/owners/set`.
+Every alert in this section goes to **all** of them.
+
+### Moisture threshold per well
+
+`set_irrigation_threshold` now carries a target as well as a percentage —
+`wellThresholds` is keyed by `pumpId`, `block:<blockId>` or `default`, so each pump/block can be
+tuned separately; `.pump threshold 40 <pumpId>` does the same from chat. Note what the UI repeats:
+**the rover has no soil-moisture sensor — only the water pump does**, so a threshold only ever
+matches readings that came from a pump.
+
+### Stop points and app updates
+
+* The field map accepts a `stopPoints` list (`FieldStopPoint { id, label, latitude, longitude, order? }`,
+  at most 200 per block) — the places where the robot must stop while scanning. They are stored
+  with the block, so re-mapping a block reuses the same points.
+* `GET /api/app/release` returns the newest `chrclient` release for the in-app updater
+  (`UPDATE_REPO`, `UPDATE_TAG`, `GITHUB_API_BASE`, `GITHUB_TOKEN` override the defaults). The
+  request asks for the release **tag** first: this project publishes its rolling build under the
+  tag literally named `latest`, so GitHub has no “latest release” for it and
+  `releases/latest` alone answers 404.
+
+Run the regression suites in the repository root:
+
+```bash
+npm i --no-save socket.io-client
+npx tsx chrserver-verify-task7.ts   # rain/fuel safety, owner numbers, thresholds, stop points, updater
+```
+
+---
+
+>>>>>>> theirs
 ## Serving the web app (chrclient web build)
 
 `AlexaInc/chrserver` also publishes the **web version of the dashboard**, so

@@ -68,6 +68,15 @@ async function startApp() {
     // DB says the service is enabled AND a session exists on disk — a fresh
     // install stays idle until an account is paired from Settings → WhatsApp.
     const whatsapp = WhatsAppService.getInstance(logger, db);
+
+    /**
+     * Safety alerts (rain detected, petrol empty) are raised by the socket layer
+     * and delivered here: every saved owner number gets the message. The link is
+     * wired from outside because WhatsAppService imports WSServer, so a direct
+     * import in the other direction would make a cycle.
+     */
+    wsServer.ownerNotifier = (text, options) => whatsapp.notifyOwners(text, options);
+
     void whatsapp.autoStart();
 }
 

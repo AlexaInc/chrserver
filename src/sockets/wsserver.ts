@@ -8,12 +8,29 @@ import { planMission, AutonomousMission } from "../services/MissionPlanner";
 import { createHash } from "crypto";
 
 export interface RobotMessage<T = any> { Type: string; Message: T; }
+/**
+ * A place inside a block where the rover must come to a real stop (row end,
+ * gate, water point, a plant that needs a close look). The app marks these while
+ * mapping and they ride along inside the block, so re-mapping a block keeps the
+ * stops it already had.
+ */
+export interface FieldStopPoint {
+    id: string;
+    label: string;
+    latitude: number;
+    longitude: number;
+    /** order the robot should visit them in (1-based when set) */
+    order?: number;
+}
+
 export interface FieldBlock {
     id: string; name: string; plant: string; aiModel?: string; color?: string;
     polygon: [number, number][];
     rowSpacingM?: number;
     scanSpacingM?: number;
     headingDeg?: number;
+    /** places the rover halts at inside this block */
+    stopPoints?: FieldStopPoint[];
 }
 export interface FieldMapMessage {
     name: string; boundary: [number, number][]; blocks: FieldBlock[];
@@ -60,7 +77,7 @@ export const DEFAULT_FLEET_CONFIG: FleetConfig = {
     // Bracket angles of the printed front mounts: the two side sensors are
     // splayed outwards, which is what removes the blind spot between the centre
     // beam and each corner. Manual driving gets the avoid assist by default.
-    sensorAngleLeftDeg: 45, sensorAngleRightDeg: 45, avoidAssist: true,
+    sensorAngleLeftDeg: 35, sensorAngleRightDeg: 35, avoidAssist: true,
 };
 /** Percentages coming from the app/panel are clamped into a hard 0-100 range. */
 export const clampPercent = (value: unknown, fallback: number): number => {
@@ -88,6 +105,56 @@ const ROVER_ACTIONS = new Set([
     // non-blocking motion engine (see chrhw wokwi-esp32-project).
     "set_speed", "motion_config", "get_motion_status", "get_map_status",
 ]);
+/**
+ * Rain + fuel safety (the operator's rule).
+ *
+ * Rain: the raindrop sensor on the pump (or the rover, or an operator in the
+ * app) reports rain → the pump is switched OFF and locked off, the robot is sent
+ * back to its base point, and every saved owner number gets a WhatsApp alert.
+ *
+ * Fuel: this rover has no fuel gauge, so the empty tank is reported (by the
+ * operator's button or by the firmware's run-hour counter) and the report goes
+ * to all owner numbers together with the last known position.
+ *
+ * Thresholds are environment-tunable so a wetter field can be dialled in without
+ * a rebuild.
+ */
+const RAIN_THRESHOLD_PERCENT = Math.max(1, Math.min(100, Number(process.env.RAIN_THRESHOLD_PERCENT ?? 60)));
+/** how far the reading must fall back before "it stopped raining" is accepted */
+const RAIN_CLEAR_HYSTERESIS = Math.max(5, Number(process.env.RAIN_CLEAR_HYSTERESIS ?? 15));
+/** the rain sequence runs at most once per window, however chatty the sensor is */
+const RAIN_SEQUENCE_THROTTLE_MS = 5 * 60_000;
+
+/** Persisted safety state (settings key `safetyState`). */
+export interface SafetyState {
+    raining: boolean;
+    rainStartedAt: number | null;
+    rainEndedAt: number | null;
+    lastRainPercent: number | null;
+    lastRainSource: string | null;
+    /** pump is kept OFF while it rains; an explicit override clears this */
+    pumpLocked: boolean;
+    returnToBaseAt: number | null;
+    fuelEmpty: boolean;
+    fuelEmptyAt: number | null;
+    fuelEmptyNote: string | null;
+    fuelRunMinutes: number | null;
+}
+
+export const DEFAULT_SAFETY_STATE: SafetyState = {
+    raining: false,
+    rainStartedAt: null,
+    rainEndedAt: null,
+    lastRainPercent: null,
+    lastRainSource: null,
+    pumpLocked: false,
+    returnToBaseAt: null,
+    fuelEmpty: false,
+    fuelEmptyAt: null,
+    fuelEmptyNote: null,
+    fuelRunMinutes: null,
+};
+
 /** Actions the ESP32-C3 pump firmware genuinely understands (see chrhw wokwi-water-pump-c3). */
 const PUMP_ACTIONS = new Set([
     "pump_on", "pump_off", "pump_auto", "set_irrigation_threshold", "irrigate_block", "stop_irrigation",
@@ -226,6 +293,18 @@ export class WSServer {
     private static instance: WSServer;
     private readonly deviceSockets = new Map<string, string>();
     private readonly onlineRoles = new Set<string>(); // "esp_32" | "esp_c3_pump"
+    /** when the rain sequence last ran, so a flapping sensor cannot spam owners */
+    private lastRainSequenceAt = 0;
+    /** newest-release answer for the app's self-update check (10 minute cache) */
+    private releaseCache: {
+        release: any; fetchedAt: number; cached: boolean;
+    } | null = null;
+    /** Set by server.ts: delivers an owner alert through the WhatsApp service
+     *  (the service imports this class, so the link is wired in from outside to
+     *  keep the module graph acyclic). */
+    public ownerNotifier:
+        | ((text: string, options: { title?: string; buttons?: Array<Array<{ label: string; id: string }>> }) => Promise<{ sent: string[]; failed: string[] }>)
+        | null = null;
     /** Last operator mode INTENT (change_mode/manual_teleop). Reporting the
      *  live mode to clients never trusts this flag alone — computeStatus()
      *  derives the mode from what the rover is verifiably doing, because the
@@ -640,6 +719,10 @@ export class WSServer {
     } = {}, from?: string): Promise<CommandAck> {
         try {
             if (!this.isRobotOnline()) return { success: false, reason: "Robot offline" };
+            const safety = await this.getSafetyState();
+            if (safety.fuelEmpty) {
+                return { success: false, reason: "The rover is out of petrol (open report) — refuel and confirm with `.fuel refilled` first" };
+            }
             const map = await this.getFieldMap();
             if (!map) return { success: false, reason: "Create and save a field map first" };
             const fleetConfig = await this.getFleetConfig();
@@ -709,11 +792,306 @@ export class WSServer {
     public async controlPump(action: string, data?: unknown, from?: string): Promise<CommandAck> {
         if (!PUMP_ACTIONS.has(action)) return { success: false, reason: `Unknown action "${action}"` };
         if (!this.isPumpOnline()) return { success: false, reason: "Pump controller offline" };
+
+        /**
+         * RAIN LOCK — while rain is being detected the pump may not be switched
+         * on, from the app, from WhatsApp or by the auto rule. The lock is what
+         * makes "rain → pump off" stick instead of lasting one timer cycle.
+         */
+        const d = (data ?? {}) as Record<string, any>;
+        const safety = await this.getSafetyState();
+        if (safety.pumpLocked && action === "pump_on" && d.forceRain !== true) {
+            return {
+                success: false,
+                reason: "Rain lock: the pump stays OFF while rain is being detected. Wait for the sensor to dry out, " +
+                    "or override deliberately with force=true (`.pump_on <seconds> force` in WhatsApp).",
+            };
+        }
+        if (safety.pumpLocked && action === "pump_auto" && d.enabled === true) {
+            // Auto mode would restart the pump as soon as the soil is dry — while
+            // it is raining that is exactly what must not happen.
+            return { success: false, reason: "Rain lock: auto irrigation stays OFF until the rain sensor dries out." };
+        }
+
+        // Per-well auto-watering threshold: the probe lives on the pump, so the
+        // value is remembered per pump/block and pushed back to that node.
+        if (action === "set_irrigation_threshold") {
+            const percent = Number(d.moisturePercent);
+            if (!Number.isFinite(percent)) return { success: false, reason: "moisturePercent must be a number" };
+            const key = String(d.pumpId ?? (d.blockId ? `block:${d.blockId}` : "default"));
+            const wellThresholds = await this.db.getSetting<Record<string, number>>("wellThresholds", {});
+            wellThresholds[key] = Math.max(0, Math.min(100, Math.round(percent)));
+            await this.db.setSetting("wellThresholds", wellThresholds);
+            this.io.to("authorized_room").emit("message.upsert", {
+                Type: "well_thresholds", Message: { thresholds: wellThresholds, updatedKey: key },
+            });
+        }
+
         this.io.to("pump_room").emit("control_command", {
             ...(from ? { from } : {}),
             command: { action, ...(data !== undefined ? { data } : {}), timestamp: Date.now() },
         });
         return { success: true, message: `${action} forwarded`, data: { target: "pump_room" } };
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Rain + fuel safety                                                  */
+    /* ------------------------------------------------------------------ */
+
+    /** Current safety state (rain lock, petrol-empty flag) — persisted, so a
+     *  server restart does not forget that it is raining. */
+    public async getSafetyState(): Promise<SafetyState> {
+        return { ...DEFAULT_SAFETY_STATE, ...(await this.db.getSetting<Partial<SafetyState>>("safetyState", {})) };
+    }
+
+    private async patchSafetyState(patch: Partial<SafetyState>): Promise<SafetyState> {
+        const next = { ...(await this.getSafetyState()), ...patch };
+        await this.db.setSetting("safetyState", next);
+        this.io.to("authorized_room").emit("message.upsert", { Type: "safety", Message: next });
+        return next;
+    }
+
+    /**
+     * The whole rain sequence in one place: pump OFF + locked, robot back to its
+     * base point, alert on every screen and a WhatsApp message to every owner
+     * number. Called by the sensor path, by the firmware, and by the operator's
+     * "I see rain" button.
+     */
+    public async runRainSequence(
+        source: string, rainPercent?: number, by?: string,
+    ): Promise<CommandAck> {
+        const state = await this.getSafetyState();
+        const firstThisEpisode = !state.raining;
+        await this.patchSafetyState({
+            raining: true,
+            rainStartedAt: state.raining ? state.rainStartedAt : Date.now(),
+            lastRainPercent: Number.isFinite(rainPercent as number) ? Number(rainPercent) : state.lastRainPercent,
+            lastRainSource: source,
+            pumpLocked: true,
+            rainEndedAt: null,
+        });
+
+        const pumpResult = await this.controlPump("pump_off", { reason: "rain", force: true }, by ?? "rain-sequence").catch(() => null);
+
+        // Auto irrigation must not restart the pump while it is raining.
+        if (this.isPumpOnline()) {
+            this.io.to("pump_room").emit("control_command", {
+                command: { action: "pump_auto", data: { enabled: false, reason: "rain" }, timestamp: Date.now() },
+            });
+        }
+
+        let robotSent: CommandAck | null = null;
+        if (this.isRobotOnline()) {
+            robotSent = await this.controlRobot("return_to_base", { reason: "rain" }, by ?? "rain-sequence").catch(() => null);
+            await this.patchSafetyState({ returnToBaseAt: Date.now() });
+        }
+
+        const reading = Number.isFinite(rainPercent as number) ? ` (${Math.round(Number(rainPercent))}% on the sensor)` : "";
+        const where = await this.lastKnownPositionText();
+        const summary =
+            `Rain detected${reading} — source: ${source}.\n` +
+            `• water pump: OFF and locked off while it keeps raining\n` +
+            `• robot: ${this.isRobotOnline() ? "sent back to its base point" : "offline — nothing to drive"}\n` +
+            `• auto irrigation: switched OFF${where ? `\n• last known position: ${where}` : ""}`;
+
+        if (firstThisEpisode) {
+            await this.raiseAlert("critical", "Rain detected — pump off, robot returning to base", summary, source);
+            await this.notifyOwners(summary, "🌧️ Rain safety", by);
+        }
+
+        await this.broadcastStatus();
+        return {
+            success: true,
+            message: firstThisEpisode
+                ? "Rain sequence run: pump off + locked, robot returning to base, owners alerted"
+                : "It is still raining — pump stays locked off",
+            data: { pump: pumpResult, robot: robotSent, state: await this.getSafetyState() },
+        };
+    }
+
+    /** Rain has stopped (reading fell back far enough): unlock and tell the owners. */
+    public async clearRain(rainPercent: number | null, source: string): Promise<void> {
+        const state = await this.getSafetyState();
+        if (!state.raining) return;
+        await this.patchSafetyState({
+            raining: false,
+            rainEndedAt: Date.now(),
+            pumpLocked: false,
+            lastRainPercent: Number.isFinite(rainPercent as number) ? rainPercent : state.lastRainPercent,
+        });
+        const text =
+            `Rain sensor is dry again${Number.isFinite(rainPercent as number) ? ` (${Math.round(Number(rainPercent))}%)` : ""} ` +
+            `— source: ${source}.\nThe pump lock is released. Auto irrigation stays OFF until you switch it back on.`;
+        await this.raiseAlert("info", "Rain stopped — pump unlocked", text, source);
+        await this.notifyOwners(text, "🌤️ Rain stopped");
+        await this.broadcastStatus();
+    }
+
+    /**
+     * Petrol-empty report: the rover has no fuel gauge, so the operator's button
+     * (or the firmware's run-hour counter) reports it and the report goes to
+     * every owner number with the last known position.
+     */
+    public async reportFuelEmpty(data: { note?: string; runMinutes?: number } = {}, by?: string): Promise<CommandAck> {
+        const position = await this.lastKnownPositionText();
+        await this.patchSafetyState({
+            fuelEmpty: true,
+            fuelEmptyAt: Date.now(),
+            fuelEmptyNote: data.note ?? null,
+            fuelRunMinutes: Number.isFinite(data.runMinutes as number) ? Number(data.runMinutes) : null,
+        });
+        if (this.isRobotOnline()) {
+            // A rover with an empty tank must not be left holding a running mission.
+            await this.controlRobot("stop", { reason: "fuel-empty" }, by ?? "fuel-report").catch(() => null);
+        }
+        const text =
+            `⛽ *PETROL EMPTY REPORT*\n` +
+            `The rover has run out of petrol.\n` +
+            (position ? `• last known position: ${position}\n` : "") +
+            (data.runMinutes != null ? `• engine run time since the last refill: ${Math.round(Number(data.runMinutes))} min\n` : "") +
+            (data.note ? `• note: ${data.note}\n` : "") +
+            `Bring fuel before the next patrol — missions are blocked until the tank is refilled.`;
+        await this.raiseAlert("critical", "Petrol empty — rover cannot move", text.replace(/\*/g, ""), by ?? "fuel-report");
+        await this.notifyOwners(text, "⛽ Petrol empty", by, [
+            [{ label: "📍 Robot status", id: ".status" }, { label: "🏠 Return to base", id: ".robot return_base" }],
+        ]);
+        await this.broadcastStatus();
+        return { success: true, message: "Petrol-empty report sent to all owner numbers", data: await this.getSafetyState() };
+    }
+
+    /** Tank refilled (operator confirms) — missions are allowed again. */
+    public async clearFuelEmpty(by?: string): Promise<CommandAck> {
+        const state = await this.getSafetyState();
+        if (!state.fuelEmpty) return { success: false, reason: "There is no open petrol-empty report" };
+        await this.patchSafetyState({ fuelEmpty: false, fuelEmptyAt: null, fuelEmptyNote: null });
+        const text = `⛽ Tank refilled — the petrol-empty report is closed. Missions can be deployed again.`;
+        await this.raiseAlert("info", "Petrol refilled", text, by ?? "operator");
+        await this.notifyOwners(text, "⛽ Refuelled", by);
+        await this.broadcastStatus();
+        return { success: true, message: "Petrol-empty report closed" };
+    }
+
+    /** "lat, lng" of the newest fix, for the alert texts. */
+    private async lastKnownPositionText(): Promise<string | null> {
+        try {
+            const last = await this.db.getLatestLocation();
+            if (!last) return null;
+            return `${Number(last.latitude).toFixed(5)}, ${Number(last.longitude).toFixed(5)}`;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Newest published app release, for the app's self-update check.
+     *
+     * Read through the server for three reasons: a phone on the farm network may
+     * not be able to reach api.github.com at all, GitHub rate-limits anonymous
+     * callers per IP (and every phone would burn that budget), and the server can
+     * carry a GITHUB_TOKEN. Cached for ten minutes.
+     */
+    public async getLatestReleaseInfo(): Promise<{
+        release: null | {
+            tag_name: string; name: string | null; version: string; body: string | null;
+            published_at: string | null; html_url: string;
+            assets: Array<{ name: string; size: number; updated_at: string | null; browser_download_url: string }>;
+        };
+        cached: boolean;
+        fetchedAt: number;
+        error?: string;
+    }> {
+        const repo = process.env.UPDATE_REPO ?? process.env.WEBAPP_REPO ?? "AlexaInc/chrclient";
+        const now = Date.now();
+        if (this.releaseCache && now - this.releaseCache.fetchedAt < 10 * 60_000) {
+            return { ...this.releaseCache, cached: true };
+        }
+        try {
+            const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+            const headers: Record<string, string> = {
+                Accept: "application/vnd.github+json",
+                "User-Agent": "chrserver",
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            };
+            const apiBase = process.env.GITHUB_API_BASE ?? "https://api.github.com";
+            const wanted = process.env.UPDATE_TAG ?? process.env.WEBAPP_RELEASE_TAG ?? "latest";
+            const get = async (path: string) => {
+                const res = await fetch(`${apiBase}${path}`, { headers, signal: AbortSignal.timeout(12_000) });
+                if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${path}`);
+                return res.json();
+            };
+            // This project publishes under a release/tag literally named "latest",
+            // so ask for that tag first and only then for the newest release —
+            // exactly the order chrclient's own updater uses.
+            let raw: any;
+            try {
+                raw = await get(`/repos/${repo}/releases/tags/${encodeURIComponent(wanted)}`);
+            } catch {
+                raw = await get(`/repos/${repo}/releases/latest`);
+            }
+            const tag = String(raw?.tag_name ?? "");
+            const name = typeof raw?.name === "string" ? raw.name : null;
+            const body = typeof raw?.body === "string" ? raw.body : null;
+            /**
+             * Rolling builds are published under the tag "latest", so the tag
+             * alone carries no version. The CI puts it in the release name
+             * ("Latest build (main) · 1.0.0-dev.12") and in the body, so all
+             * three places are checked before falling back to the tag.
+             */
+            const versionFrom = (text: string | null): string | null => {
+                const m = text?.match(/\d+\.\d+\.\d+(?:-dev\.\d+)?/);
+                return m ? m[0] : null;
+            };
+            const version = /\d+\.\d+/.test(tag)
+                ? tag.replace(/^v/i, "")
+                : versionFrom(name) ?? versionFrom(body) ?? tag.replace(/^v/i, "");
+            const release = {
+                tag_name: tag,
+                name,
+                version,
+                body: typeof raw?.body === "string" ? raw.body.slice(0, 2000) : null,
+                published_at: raw?.published_at ?? null,
+                html_url: String(raw?.html_url ?? `https://github.com/${repo}/releases`),
+                assets: (Array.isArray(raw?.assets) ? raw.assets : []).map((a: any) => ({
+                    name: String(a?.name ?? ""),
+                    size: Number(a?.size ?? 0),
+                    updated_at: typeof a?.updated_at === "string" ? a.updated_at : null,
+                    browser_download_url: String(a?.browser_download_url ?? ""),
+                })),
+            };
+            this.releaseCache = { release, fetchedAt: now, cached: false };
+            return this.releaseCache;
+        } catch (error: any) {
+            const message = error?.message ?? "release lookup failed";
+            logger.warn(`[UPDATE] could not read the latest release of ${repo}: ${message}`);
+            // Keep serving the last answer rather than going dark on a hiccup.
+            if (this.releaseCache) return { ...this.releaseCache, cached: true, error: message };
+            return { release: null, cached: false, fetchedAt: now, error: message };
+        }
+    }
+
+    /**
+     * Send a card to every owner number over WhatsApp. The server wires the
+     * WhatsApp service in at startup (see server.ts) — until then the alert still
+     * reaches the app, it just does not leave the server as a chat message.
+     */
+    public async notifyOwners(
+        text: string,
+        title?: string,
+        by?: string,
+        buttons?: Array<Array<{ label: string; id: string }>>,
+    ): Promise<{ sent: string[]; failed: string[] }> {
+        if (!this.ownerNotifier) {
+            logger.warn("Owner alert not delivered over WhatsApp: no notifier registered");
+            return { sent: [], failed: [] };
+        }
+        try {
+            const result = await this.ownerNotifier(text, { title, buttons });
+            logger.info({ sent: result.sent.length, failed: result.failed.length, by }, "Owner alert delivered");
+            return result;
+        } catch (error: any) {
+            logger.warn({ error }, "Owner alert failed");
+            return { sent: [], failed: [] };
+        }
     }
 
     /* ------------------------------------------------------------------ */
@@ -728,6 +1106,10 @@ export class WSServer {
         const last = this.alertThrottle.get(key) ?? 0;
         if (throttleMs > 0 && Date.now() - last < throttleMs) return;
         this.alertThrottle.set(key, Date.now());
+        // A repeat of the same alert (rain, low moisture, GPS/map sync …) closes
+        // the previous one, so the app's counter falls back to zero by itself
+        // instead of needing an "acknowledge all" press.
+        await this.db.acknowledgeSuperseded(title).catch(() => 0);
         const row = await this.db.createAlert({ severity, title, description, source });
         this.io.to("authorized_room").emit("message.upsert", {
             Type: "alert",
@@ -882,15 +1264,46 @@ export class WSServer {
                         });
                     }
 
-                    if (rest.isRaining === true && (!previous || previous.is_raining !== 1)) {
-                        await this.raiseAlert("warning", "Rain detected",
-                            `Rain sensor triggered near ${rest.blockId || "the field"}. Consider pausing the patrol.`,
-                            "esp_32", 5 * 60_000);
+                    /**
+                     * RAIN: the rover's own raindrop sensor is one of the two
+                     * sensors that can start the rain sequence (the pump's sensor
+                     * is the other). Only a real transition is acted on, and the
+                     * sequence itself is throttled, so a flapping reading cannot
+                     * spam the owners.
+                     */
+                    const rainPercent = Number.isFinite(rest.rainDrop as number) ? Number(rest.rainDrop) : null;
+                    const rainingNow = rest.isRaining === true || (rainPercent != null && rainPercent >= RAIN_THRESHOLD_PERCENT);
+                    const safety = await this.getSafetyState();
+                    if (rainingNow && (!previous || previous.is_raining !== 1 || !safety.raining)) {
+                        await this.runRainSequence("rover-sensor", rainPercent ?? undefined, "esp_32");
+                        this.lastRainSequenceAt = Date.now();
+                    } else if (
+                        !rainingNow &&
+                        safety.raining &&
+                        Date.now() - (this.lastRainSequenceAt ?? 0) > RAIN_SEQUENCE_THROTTLE_MS &&
+                        (rainPercent == null || rainPercent <= RAIN_THRESHOLD_PERCENT - RAIN_CLEAR_HYSTERESIS)
+                    ) {
+                        await this.clearRain(rainPercent, "rover-sensor");
                     }
                     return;
                 }
 
                 if (data.Type === "irrigation" && role === "esp_c3_pump") {
+                    // The pump node carries the rain sensor and the soil probe.
+                    const pumpRain = Number.isFinite(message.rainPercent ?? message.rainDrop) ? Number(message.rainPercent ?? message.rainDrop) : null;
+                    if (pumpRain != null) {
+                        const safety = await this.getSafetyState();
+                        if (pumpRain >= RAIN_THRESHOLD_PERCENT && !safety.raining) {
+                            await this.runRainSequence("pump-sensor", pumpRain, "pump-01");
+                            this.lastRainSequenceAt = Date.now();
+                        } else if (
+                            safety.raining &&
+                            pumpRain <= RAIN_THRESHOLD_PERCENT - RAIN_CLEAR_HYSTERESIS &&
+                            Date.now() - (this.lastRainSequenceAt ?? 0) > RAIN_SEQUENCE_THROTTLE_MS
+                        ) {
+                            await this.clearRain(pumpRain, "pump-sensor");
+                        }
+                    }
                     await this.db.saveIrrigationReading({
                         deviceId: message.deviceId, pumpOn: Boolean(message.pumpOn), autoMode: Boolean(message.autoMode),
                         soilMoisture: message.soilMoisture, threshold: message.threshold, activeBlockId: message.activeBlockId,
@@ -990,6 +1403,28 @@ export class WSServer {
                     const id = await this.db.registerCropBatch(data.data);
                     return ack({ success: true, message: "Crop batch registered", data: { id } });
                 }
+                if (data.action === "report_rain") {
+                    // Rain seen by an operator (or relayed by the firmware): the
+                    // whole sequence runs server-side so the phone can be closed.
+                    return ack(await this.runRainSequence(
+                        data.data?.source === "sensor" ? "sensor" : "operator",
+                        Number(data.data?.rainPercent),
+                        socket.id,
+                    ));
+                }
+                if (data.action === "report_fuel_empty") {
+                    return ack(await this.reportFuelEmpty({
+                        note: data.data?.note,
+                        runMinutes: data.data?.runMinutes,
+                    }, socket.id));
+                }
+                if (data.action === "fuel_refilled") {
+                    return ack(await this.clearFuelEmpty(socket.id));
+                }
+                if (data.action === "rain_clear") {
+                    await this.clearRain(Number(data.data?.rainPercent), "operator");
+                    return ack({ success: true, message: "Rain lock cleared" });
+                }
                 if (data.action === "acknowledge_alerts") {
                     // Purely a server/DB concern — never forwarded to a device.
                     const ids = Array.isArray(data.data?.ids) ? data.data.ids as number[] : undefined;
@@ -1063,7 +1498,11 @@ export class WSServer {
     private validMap(map: FieldMapMessage): boolean {
         if (!map || typeof map.name !== "string" || !Array.isArray(map.blocks) || !Array.isArray(map.boundary)) return false;
         return map.blocks.every((b) => b.id && b.name && b.plant && Array.isArray(b.polygon) && b.polygon.length >= 3 &&
-            b.polygon.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)));
+            b.polygon.every((p) => Array.isArray(p) && p.length === 2 && p.every(Number.isFinite)) &&
+            // stop points are optional, but if present they must be sane points
+            (b.stopPoints === undefined || (Array.isArray(b.stopPoints) && b.stopPoints.length <= 200 &&
+                b.stopPoints.every((sp) => sp && typeof sp.id === "string" && typeof sp.label === "string" &&
+                    Number.isFinite(sp.latitude) && Number.isFinite(sp.longitude)))));
     }
 
     public static getInstance(): WSServer {

@@ -146,8 +146,17 @@ export interface AlertRow {
  * restarts instead of being a hardcoded `null`.
  */
 export interface WhatsAppSettings {
-    /** The ONLY number allowed to issue control commands (country code included). */
+    /**
+     * Primary owner number (country code included) — always `ownerNumbers[0]`.
+     * Kept for older clients/routes that still speak about "the owner number".
+     */
     ownerNumber: string | null;
+    /**
+     * EVERY number allowed to command the robot/pump. Up to MAX_OWNER_NUMBERS,
+     * all of them receive the alerts (rain, petrol empty, faults). A farm has
+     * more than one person who may need to stop a pump.
+     */
+    ownerNumbers: string[];
     /** Start the WhatsApp service automatically on boot. */
     enabled: boolean;
     /** Number the current/past bot session was paired for (country code included). */
@@ -162,11 +171,15 @@ export interface WhatsAppSettings {
 
 export const DEFAULT_WHATSAPP_SETTINGS: WhatsAppSettings = {
     ownerNumber: null,
+    ownerNumbers: [],
     enabled: false,
     linkedNumber: null,
     linkedAt: null,
     ownerLids: [],
 };
+
+/** Hard cap agreed with the operator's specification. */
+export const MAX_OWNER_NUMBERS = 10;
 
 /** What the rover ("esp_32") actually reports per tick — Type:"sensors". */
 export interface RoverSensorMessage {
@@ -491,6 +504,12 @@ export class CHRDatabase {
     /* ================================================================ */
 
     /** Last `limit` fixes, oldest→newest — map trail after a restart. */
+    /** The single newest GPS fix — used by the alert texts ("last known position"). */
+    public async getLatestLocation(): Promise<LocationRow | undefined> {
+        return this.db.get<LocationRow>(
+            `SELECT * FROM location_history ORDER BY received_at DESC LIMIT 1`);
+    }
+
     public async getRecentTrail(limit = 200): Promise<LocationRow[]> {
         const rows = await this.db.all<LocationRow[]>(
             `SELECT * FROM location_history ORDER BY received_at DESC LIMIT ?`, limit);
@@ -668,6 +687,18 @@ export class CHRDatabase {
         return row?.n ?? 0;
     }
 
+    /**
+     * Acknowledge every still-open alert with the same title. Repeat alerts (the
+     * noisy GPS / field-map / low-moisture ones) therefore never stack up: only
+     * the newest one stays open, so the app's badge falls back to zero without
+     * anybody pressing "acknowledge".
+     */
+    public async acknowledgeSuperseded(title: string): Promise<number> {
+        const r = await this.db.run(
+            `UPDATE alerts SET acknowledged_at=? WHERE title=? AND acknowledged_at IS NULL`, now(), title);
+        return r.changes ?? 0;
+    }
+
     /** The most recent alert of `title`, used to throttle repeat alerts (e.g. rain). */
     public getLastAlertByTitle(title: string): Promise<AlertRow | undefined> {
         return this.db.get<AlertRow>(
@@ -691,14 +722,37 @@ export class CHRDatabase {
     /* WhatsApp service state (owner number + session bookkeeping)       */
     /* ================================================================ */
 
-    /** Full WhatsApp settings, defaults filled in for older DBs. */
+    /**
+     * Full WhatsApp settings, defaults filled in for older DBs.
+     *
+     * Migration: a database written before owner numbers became a list still has
+     * the single `ownerNumber`; it is promoted to the first entry of the list so
+     * nothing is lost and the command gate keeps working.
+     */
     public async getWhatsAppSettings(): Promise<WhatsAppSettings> {
         const stored = await this.getSetting<Partial<WhatsAppSettings>>("whatsapp", {});
+        const list = Array.isArray(stored.ownerNumbers)
+            ? stored.ownerNumbers.filter((n): n is string => typeof n === "string" && n.length > 0)
+            : [];
+        const ownerNumbers = (list.length ? list : stored.ownerNumber ? [stored.ownerNumber] : [])
+            .filter((n, i, all) => all.indexOf(n) === i)
+            .slice(0, MAX_OWNER_NUMBERS);
         return {
             ...DEFAULT_WHATSAPP_SETTINGS,
             ...stored,
+            ownerNumbers,
+            ownerNumber: ownerNumbers[0] ?? null,
             ownerLids: Array.isArray(stored.ownerLids) ? stored.ownerLids : [],
         };
+    }
+
+    /** Save the whole list (the cap and the primary number stay consistent). */
+    public async setOwnerNumbers(numbers: string[]): Promise<WhatsAppSettings> {
+        const list = numbers
+            .filter((n) => typeof n === "string" && n.length > 0)
+            .filter((n, i, all) => all.indexOf(n) === i)
+            .slice(0, MAX_OWNER_NUMBERS);
+        return this.saveWhatsAppSettings({ ownerNumbers: list, ownerNumber: list[0] ?? null, ownerLids: [] });
     }
 
     /** Merge-and-save (partial updates are fine). */
