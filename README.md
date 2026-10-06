@@ -27,6 +27,7 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
 - [Real-Time (Socket.IO) API](#real-time-socketio-api)
 - [Operator safety, owner numbers & per-well moisture](#operator-safety-owner-numbers--per-well-moisture)
 - [Serving the web app (chrclient web build)](#serving-the-web-app-chrclient-web-build)
+- [Push notifications to the operator's phone](#push-notifications-to-the-operators-phone)
 - [WhatsApp Service](#whatsapp-service)
 - [Where This Fits in the Overall System](#where-this-fits-in-the-overall-system)
 - [Known Issues / To Do](#known-issues--to-do)
@@ -180,6 +181,10 @@ Configuration is currently minimal and read from environment variables:
 | `LOG_LEVEL`  | `info`  | pino log level (`trace`, `debug`, `info`, `warn`, `error`, ...).   |
 | `ROBOT_TOKEN` | — | Dedicated credential for `esp_32` robot devices and image uploads. |
 | `PUMP_TOKEN` | — | Different credential for `esp_c3_pump` irrigation controllers. |
+| `PUSH_ENABLED` | `true` | Set to `false` to stop all push sending without touching any phone. |
+| `PUSH_MIN_SEVERITY` | `warning` | Quietest alert level that is pushed (`info` / `warning` / `critical`). |
+| `EXPO_ACCESS_TOKEN` | — | Optional Expo push access token, when the Expo account requires one. |
+| `PUSH_URL` | Expo push endpoint | Point at your own gateway if you leave the Expo push service. |
 
 > The listening port (`8000`) and host (`0.0.0.0`) are set in `src/index.ts`. To change
 > them, edit the `new Server({ port, domain })` call. Moving these to environment
@@ -422,6 +427,56 @@ rover stopped instead of guessing.
 
 ---
 
+## Push notifications to the operator's phone
+
+The app alone cannot notify a phone that is in a pocket: only the **server** knows when an alert
+happens, and only the **phone** can be woken. This server is the bridge.
+
+**How an alert travels:** any alert raised anywhere in the system funnels through
+`raiseAlert()` (`src/sockets/wsserver.ts`). Beside the existing WhatsApp delivery it now hands the
+same alert to `PushService`, which posts an Expo push message to every phone that registered a
+token. Nothing else changed — the socket broadcast, the database row and the throttle behaviour
+are exactly as before, and a push failure can never stop the alert itself.
+
+**Severity and channels** — the phone picks how loud it wants to be (Settings → NOTIFICATIONS,
+default *warnings & critical*); the server keeps its own floor with `PUSH_MIN_SEVERITY`, so a
+phone cannot subscribe itself to noise the operator does not want:
+
+| Severity | Android channel | Priority | Typical alerts |
+| --- | --- | --- | --- |
+| `critical` | `safety` | `max` | rain detected, petrol empty, emergency stop, drive failsafe |
+| `warning` | `alerts` | `high` | robot offline, GPS lost, field-map sync, low petrol |
+| `info` | `alerts` | `default` | notes, informational entries (below the default floor) |
+
+**Devices** live in the database (setting key `pushDevices`), up to 20, least-recently-seen
+dropped first. Registering the same phone twice updates its record instead of duplicating it, and
+a token Expo reports as `DeviceNotRegistered` is retired automatically — an uninstalled app is not
+pushed to for ever. Network and 5xx failures are retried; a 4xx is reported instead of retried,
+because a rejected payload is a bug on our side, not a flaky network.
+
+### Endpoints
+
+| Method | Path | What it does |
+| --- | --- | --- |
+| `POST` | `/api/push/register` | `{ token, platform, label? }` — the phone registers itself. Called on every app start. |
+| `POST` | `/api/push/unregister` | `{ token }` — remove this phone (notifications switched off, or logged out). |
+| `GET` | `/api/push` | How many phones are registered, how many pushes were sent, the last error, the last attempts. |
+| `POST` | `/api/push/test` | `{ text? }` — the Settings “Send test notification” button. |
+
+All four sit behind `authorizeClient` (the same client login as the rest of `/api`). Tokens are
+only ever shown masked (`Exxxxx…1a2b`) in responses, so a leaked log cannot be replayed.
+
+### What the operator has to do once
+
+Android needs Firebase for notifications that arrive **while the app is closed**. That key belongs
+to an account, not to a device, so it is the one manual step: create the Firebase project, add
+package `com.hansaka01.aicroprobot`, put `google-services.json` into the app repository as the
+secret `GOOGLE_SERVICES_JSON_BASE64`, and upload the FCM V1 service-account key to Expo. The
+chrclient README (Manual → §6) lists the same steps with the click-path on each site. Everything
+before and after that key — permission, token, registration, routing, alerts — is automatic.
+
+---
+
 ## WhatsApp Service
 
 One WhatsApp account is paired to the server with a **pairing code** (no QR scan) and then
@@ -643,7 +698,8 @@ This backend is one component of the larger **AI Smart Crop Health Monitoring Ro
 - **Image handling** validates but does not yet persist images (no storage/cloud upload).
 - **Configurable port/host** via environment variables.
 - **Restrict CORS** origins for production.
-- Add automated tests.
+- Push notifications for alerts arriving while the app is **closed** need the one-time Firebase
+  key described above (the app side, routing and registration are done).
 
 ---
 

@@ -11,6 +11,7 @@ import { LoadedPlantModel, predictPlant } from "./services/LoadAimodels";
 import { CHRDatabase } from "../db/Sqlight";
 import { WhatsAppService, normalizeWhatsAppNumber } from "./services/WhatsAppService";
 import { WebAppRelease } from "./services/WebAppRelease";
+import { PushService } from "./services/PushService";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 export const sessions = new Map<string, string>();
@@ -361,6 +362,54 @@ export class Server {
                 const release = await WSServer.getInstance().getLatestReleaseInfo();
                 const status = WebAppRelease.getInstance().getStatus();
                 res.send({ ok: true, ...release, servedTag: status.tag ?? null, served: status.serving });
+            } catch (e) { next(e); }
+        });
+
+        /* ---------------------------------------------------------------- */
+        /* Push notifications — the phone's own notification shade            */
+        /* ---------------------------------------------------------------- */
+
+        /**
+         * A phone registers the push token it got from Expo. Called on every app
+         * start, so a reinstall or a re-login refreshes the record instead of
+         * leaving a dead token behind (see PushService.registerDevice).
+         */
+        this.app.post("/api/push/register", this.authorizeClient, async (req, res, next) => {
+            try {
+                const out = await PushService.getInstance().registerDevice({
+                    token: req.body?.token,
+                    platform: req.body?.platform,
+                    label: req.body?.label,
+                    userId: (req as any).user?.username,
+                });
+                if (!out.ok) return res.status(400).send({ ok: false, error: out.error, devices: out.devices });
+                res.send({ ok: true, devices: out.devices });
+            } catch (e) { next(e); }
+        });
+
+        /** A phone that stops wanting notifications (or logs out) removes itself. */
+        this.app.post("/api/push/unregister", this.authorizeClient, async (req, res, next) => {
+            try {
+                const token = String(req.body?.token ?? "");
+                const out = await PushService.getInstance().removeDevice(token);
+                res.send({ ok: out.ok, devices: out.devices });
+            } catch (e) { next(e); }
+        });
+
+        /** Status for Settings: how many phones, what was sent, what failed. */
+        this.app.get("/api/push", this.authorizeClient, async (_req, res, next) => {
+            try {
+                res.send({ ok: true, push: await PushService.getInstance().getPublicStatus() });
+            } catch (e) { next(e); }
+        });
+
+        /** Settings → “Send test notification”. */
+        this.app.post("/api/push/test", this.authorizeClient, async (req, res, next) => {
+            try {
+                const out = await PushService.getInstance().sendTest(req.body?.text);
+                // `ok` comes from the send itself (no devices / disabled are not
+                // errors of the request), the status is what Settings shows.
+                res.send({ ...out, push: await PushService.getInstance().getStatus() });
             } catch (e) { next(e); }
         });
 

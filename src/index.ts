@@ -3,6 +3,7 @@ import { WSServer } from "./sockets/wsserver";
 import { loadAllPlantModels } from "./services/LoadAimodels";
 import { WhatsAppService } from "./services/WhatsAppService";
 import { WebAppRelease } from "./services/WebAppRelease";
+import { PushService } from "./services/PushService";
 import { startDuckDNSUpdater } from "./services/Duckdns";
 import { exec, ChildProcess } from "child_process";
 import {config} from "./config/config";
@@ -29,6 +30,12 @@ async function startApp() {
     // already in public/ (if any) while the check runs in the background, and
     // an unreachable GitHub leaves that copy in place.
     WebAppRelease.getInstance().start();
+
+    // Push notifications: the phones that registered a token get an OS-level
+    // notification for every alert the socket layer raises (rain, petrol empty,
+    // failsafe…). Started here so the service holds the database and is ready
+    // before the first alert can happen.
+    PushService.getInstance({ store: db });
 
     const httpServer = server.app.listen(Number(server.port), server.domain, (): void => {
         logger.info(`🚀 Server started successfully at http://${server.domain}:${server.port}`);

@@ -1,6 +1,7 @@
 import { Server, Socket } from "socket.io";
 import http from "http";
 import { logger } from "../logger";
+import { PushService } from "../services/PushService";
 import { sessions } from "../server";
 import { config } from "../config/config";
 import { CHRDatabase, AlertSeverity } from "../../db/Sqlight";
@@ -1115,6 +1116,19 @@ export class WSServer {
             Type: "alert",
             Message: { id: row.id, severity: row.severity, title: row.title, description: row.description ?? undefined, timestamp: row.created_at },
         });
+        // The phone's own notification shade, not just the app's alert list: a
+        // rain or fuel alert has to reach the operator even with the screen off.
+        // Fire-and-forget — a push failure must never hold up the alert itself.
+        const push = PushService.getInstanceOrNull();
+        if (push) {
+            void push.notifyAlert({
+                id: row.id,
+                severity: row.severity as "info" | "warning" | "critical",
+                title: row.title,
+                description: row.description ?? undefined,
+                source: row.source,
+            }).catch((e) => logger.warn(`[PUSH] alert push failed: ${e?.message ?? e}`));
+        }
     }
 
     /* ------------------------------------------------------------------ */
