@@ -12,8 +12,12 @@ import { CHRDatabase } from "../db/Sqlight";
 import { WhatsAppService, normalizeWhatsAppNumber } from "./services/WhatsAppService";
 import { WebAppRelease } from "./services/WebAppRelease";
 import { PushService } from "./services/PushService";
+import { FirmwareRelease, firmwarePath } from "./services/FirmwareRelease";
+import { FIRMWARE_PAGE_HTML } from "./admin/firmwarePage";
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+// Firmware images are flashed as-is, so they get their own (bigger) limit.
+const firmwareUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 16 * 1024 * 1024 } });
 export const sessions = new Map<string, string>();
 
 export interface ServerConfig { port: number; domain: string; }
@@ -630,6 +634,128 @@ export class Server {
             } catch (e) { next(e); }
         });
 
+        /* ---------------------------------------------------------------- */
+        /* Firmware (OTA)                                                    */
+        /*                                                                   */
+        /* Upload + trigger are operator actions (session token). The two    */
+        /* download routes are for the boards themselves: they carry only    */
+        /* their device token, and a rover token may fetch rover images      */
+        /* while a pump token may fetch pump images - never the other way    */
+        /* around, so one board can never be handed the other's .bin.        */
+        /* ---------------------------------------------------------------- */
+
+        this.app.get("/api/firmware", this.authorizeClient, (_req, res) => {
+            res.send({ ok: true, ...FirmwareRelease.getInstance().status(), devices: WSServer.getInstance().deviceFirmwareList() });
+        });
+
+        this.app.post("/api/firmware", this.authorizeClient, firmwareUpload.single("file"), (req, res, next) => {
+            try {
+                const file = (req as Request & { file?: Express.Multer.File }).file;
+                if (!file?.buffer?.length) return res.status(400).send({ ok: false, message: "attach the compiled firmware as the 'file' field (.bin)" });
+                const target = String(req.body?.target || "").trim();
+                const version = String(req.body?.version || "").trim();
+                if (!target || !version) return res.status(400).send({ ok: false, message: "target and version are required" });
+                const build = FirmwareRelease.getInstance().saveBuild({
+                    target, version, data: file.buffer,
+                    notes: String(req.body?.notes || ""),
+                    uploadedBy: "operator",
+                });
+                logger.info({ target, version, size: build.size, md5: build.md5 }, "[OTA] firmware uploaded");
+                res.send({ ok: true, build: { ...build, file: undefined } });
+            } catch (e) { next(e); }
+        });
+
+        this.app.post("/api/firmware/update", this.authorizeClient, async (req, res, next) => {
+            try {
+                const firmware = FirmwareRelease.getInstance();
+                const wss = WSServer.getInstance();
+                const requestedTarget = String(req.body?.target || "").trim();
+                const requestedVersion = String(req.body?.version || "").trim();
+                if (!requestedTarget) return res.status(400).send({ ok: false, message: "target is required ('*' updates every board to the newest image of its own target)" });
+
+                // "*" = one button for the whole fleet: every board gets the newest
+                // image of ITS OWN target (never another board's build).
+                if (requestedTarget === "*") {
+                    const results = firmware.targets().map((target) => {
+                        const build = requestedVersion ? firmware.get(target, requestedVersion) : firmware.latest(target);
+                        if (!build) return { target, skipped: "no firmware uploaded for this target" };
+                        firmware.markPending(target, build.version, "operator");
+                        return { target, version: build.version, ...wss.sendOtaCommand(target, build) };
+                    });
+                    return res.send({ ok: true, results, devices: wss.deviceFirmwareList() });
+                }
+
+                const build = requestedVersion ? firmware.get(requestedTarget, requestedVersion) : firmware.latest(requestedTarget);
+                if (!build) {
+                    return res.status(404).send({
+                        ok: false,
+                        message: requestedVersion
+                            ? `no ${requestedVersion} image for '${requestedTarget}' — upload it first`
+                            : `no firmware uploaded for '${requestedTarget}' yet`,
+                    });
+                }
+                // Queue first: a board that is offline right now still gets it on
+                // the next device_hello, which is the whole point of the queue.
+                firmware.markPending(requestedTarget, build.version, "operator");
+                const result = wss.sendOtaCommand(requestedTarget, build);
+                logger.info({ target: requestedTarget, version: build.version, ...result }, "[OTA] operator triggered an update");
+                res.send({ ok: true, target: requestedTarget, version: build.version, md5: build.md5, size: build.size, ...result, devices: wss.deviceFirmwareList() });
+            } catch (e) { next(e); }
+        });
+
+        this.app.delete("/api/firmware/:target/:version", this.authorizeClient, (req, res, next) => {
+            try {
+                const removed = FirmwareRelease.getInstance().removeBuild(String(req.params.target), String(req.params.version));
+                if (!removed) return res.status(404).send({ ok: false, message: "no such image" });
+                res.send({ ok: true, ...FirmwareRelease.getInstance().status() });
+            } catch (e) { next(e); }
+        });
+
+        /* -- board-facing: "what is the newest image for me, and give it to me" -- */
+
+        this.app.get("/api/firmware/:target/latest", (req, res, next) => {
+            try {
+                const target = String(req.params.target);
+                const refused = this.refuseFirmwareAccess(target, req);
+                if (refused) return res.status(401).send({ ok: false, message: refused });
+                const build = FirmwareRelease.getInstance().latest(target);
+                if (!build) return res.status(404).send({ ok: false, message: `no firmware uploaded for '${target}'` });
+                res.send({
+                    ok: true, target, version: build.version, md5: build.md5, sha256: build.sha256,
+                    size: build.size, path: firmwarePath(target, build.version),
+                    uploadedAt: build.uploadedAt, notes: build.notes,
+                });
+            } catch (e) { next(e); }
+        });
+
+        this.app.get("/api/firmware/:target/bin/:version", async (req, res, next) => {
+            try {
+                const target = String(req.params.target);
+                const version = String(req.params.version);
+                const refused = this.refuseFirmwareAccess(target, req);
+                if (refused) return res.status(401).send({ ok: false, message: refused });
+                const build = FirmwareRelease.getInstance().get(target, version);
+                if (!build) return res.status(404).send({ ok: false, message: "unknown firmware image" });
+                const data = await fs.readFile(build.file);
+                logger.info({ target, version, bytes: data.length, device: req.headers["x-device-token"] ? "device" : "operator" }, "[OTA] firmware downloaded");
+                res.setHeader("Content-Type", "application/octet-stream");
+                res.setHeader("Content-Length", String(data.length));
+                res.setHeader("Content-Disposition", `attachment; filename="${build.name}"`);
+                res.setHeader("X-Firmware-Version", build.version);
+                res.setHeader("X-Firmware-MD5", build.md5);
+                res.setHeader("X-Firmware-SHA256", build.sha256);
+                res.send(data);
+            } catch (e) { next(e); }
+        });
+
+        /* -- built-in page: upload the .bin + press Update, no app needed -------- */
+
+        this.app.get("/admin/firmware", (_req, res) => {
+            res.setHeader("Content-Type", "text/html; charset=utf-8");
+            res.send(FIRMWARE_PAGE_HTML);
+        });
+        this.app.get("/admin", (_req, res) => res.redirect("/admin/firmware"));
+
         // Serve the published build. Registered LAST, and it only answers paths
         // the API above did not claim, so /api, /auth, /health and /socket.io
         // keep behaving exactly as before.
@@ -649,6 +775,22 @@ export class Server {
         if (sessions.get(token) !== config.ADMIN_USERNAME) { res.status(401).send({ ok: false, message: "Unauthorized" }); return; }
         next();
     };
+
+    /**
+     * Who may download a firmware image. Boards authenticate with their device
+     * token the same way they do for image uploads; the operator's session token
+     * also works (useful to check what a board would get).
+     */
+    private refuseFirmwareAccess(target: string, req: Request): string | null {
+        const token = String(req.headers["x-device-token"] || req.query.token || req.body?.token || "");
+        if (sessions.get(token) === config.ADMIN_USERNAME) return null;
+        const isRover = Boolean(config.ROBOT_TOKEN) && token === config.ROBOT_TOKEN;
+        const isPump = Boolean(config.PUMP_TOKEN) && token === config.PUMP_TOKEN;
+        if (isRover && target === "rover") return null;
+        if (isPump && target.startsWith("pump")) return null;
+        if (isRover || isPump) return `this token may not download images for '${target}'`;
+        return "a valid device token (X-Device-Token) or operator session is required";
+    }
 
     private isDeviceAuthorized(req: Request): boolean {
         const token = String(req.headers["x-device-token"] || req.body?.token || "");

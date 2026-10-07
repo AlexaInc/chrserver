@@ -7,6 +7,7 @@ import { config } from "../config/config";
 import { CHRDatabase, AlertSeverity } from "../../db/Sqlight";
 import { planMission, AutonomousMission } from "../services/MissionPlanner";
 import { createHash } from "crypto";
+import { FirmwareRelease, type FirmwareBuild } from "../services/FirmwareRelease";
 
 export interface RobotMessage<T = any> { Type: string; Message: T; }
 /**
@@ -260,6 +261,8 @@ export interface DeviceHello {
     deviceId: string;
     role?: string;
     firmware?: string;
+    /** Compiled FW_TARGET of the build on the board ("rover" / "pump-c3" / …). */
+    fwTarget?: string;
     mapRev?: string;
     mapBlocks?: number;
     mapBytes?: number;
@@ -480,6 +483,145 @@ export class WSServer {
                 if (role === "esp_32") void this.broadcastStatus();
             }
         });
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* OTA firmware updates                                                */
+    /* ------------------------------------------------------------------ */
+
+    /** Compiled FW_TARGET of a board we have heard from (role as a fallback). */
+    private targetOf(deviceId: string): string | undefined {
+        const hello = this.deviceHello.get(deviceId);
+        if (hello?.fwTarget) return String(hello.fwTarget);
+        if (hello?.role === "esp_32") return "rover";
+        if (hello?.role === "esp_c3_pump") return "pump";
+        return undefined;
+    }
+
+    /** Every board the server has heard from, with the firmware it reported. */
+    public deviceFirmwareList(): Array<{
+        deviceId: string;
+        role?: string;
+        firmware?: string;
+        fwTarget?: string;
+        online: boolean;
+        lastSeen: number | null;
+        mapRev?: string;
+    }> {
+        const ids = new Set<string>([...this.deviceSockets.keys(), ...this.deviceHello.keys()]);
+        return [...ids]
+            .map((deviceId) => {
+                const hello = this.deviceHello.get(deviceId);
+                return {
+                    deviceId,
+                    role: hello?.role,
+                    firmware: hello?.firmware,
+                    fwTarget: this.targetOf(deviceId),
+                    online: this.deviceSockets.has(deviceId),
+                    lastSeen: hello?.at ?? null,
+                    mapRev: hello?.mapRev,
+                };
+            })
+            .sort((a, b) => a.deviceId.localeCompare(b.deviceId));
+    }
+
+    /**
+     * Sends the `ota` command to every ONLINE board of that target. Boards of a
+     * different target are skipped on purpose — the firmware refuses a mismatch
+     * too, but the image must never even reach the wrong board.
+     */
+    public sendOtaCommand(target: string, build: FirmwareBuild): { sent: string[]; skipped: string[]; unknown: string[] } {
+        const command = FirmwareRelease.otaCommand(build);
+        const sent: string[] = [];
+        const skipped: string[] = [];
+        const unknown: string[] = [];
+        for (const [deviceId, socketId] of this.deviceSockets) {
+            const deviceTarget = this.targetOf(deviceId);
+            if (!deviceTarget) { unknown.push(deviceId); continue; }
+            if (deviceTarget !== target) { skipped.push(deviceId); continue; }
+            this.io.to(socketId).emit("control_command", { command });
+            sent.push(deviceId);
+        }
+        if (sent.length) logger.info({ target, version: build.version, devices: sent }, "[OTA] update command sent");
+        return { sent, skipped, unknown };
+    }
+
+    /**
+     * A board's own report about the update it is applying. The queue is NOT
+     * cleared here (only a reboot into the new build proves it worked) — a
+     * "failed"/"ignored" report is escalated and left for the next connection.
+     */
+    public handleOtaStatus(fromSocket: string, raw: unknown): void {
+        try {
+            const data = (typeof raw === "string" ? JSON.parse(raw) : raw) as Record<string, unknown> | null;
+            if (!data || typeof data !== "object") return;
+            const deviceId = String(fromSocket || data.deviceId || "");
+            const status = String(data.status || "");
+            const target = String(data.target || "");
+            const version = String(data.version || "");
+            const message = {
+                deviceId, target, version, status,
+                percent: typeof data.percent === "number" ? data.percent : undefined,
+                reason: typeof data.reason === "string" ? data.reason : undefined,
+                at: Date.now(),
+            };
+            logger.info(message, "[OTA] device reported an update step");
+            this.io.to("authorized_room").emit("message.upsert", { Type: "ota_status", Message: message });
+            if (status !== "failed" && status !== "ignored") return;
+            void this.raiseAlert("warning", `Firmware update ${status} on ${deviceId || target}`,
+                status === "ignored"
+                    ? `The board ignored the image for "${target}" because it runs a different build target (${message.reason || "target mismatch"}).`
+                    : `The update to ${version || "the queued build"} failed on the board: ${message.reason || "unknown reason"}. It is retried on the next connection, up to the configured limit.`,
+                deviceId || target || "esp_32", 120_000);
+        } catch (error) {
+            logger.error({ error }, "[OTA] ota_status handling failed");
+        }
+    }
+
+    /** Board came back: confirm the update it just flashed, or push it again. */
+    private async handleFirmwareHello(socket: Socket, deviceId: string, hello: DeviceHello): Promise<void> {
+        const firmware = FirmwareRelease.getInstance();
+        if (!firmware.enabled) return;
+        const target = hello.fwTarget ? String(hello.fwTarget) : undefined;
+        const decision = firmware.noteDeviceFirmware(deviceId, target, hello.firmware ? String(hello.firmware) : undefined);
+        if (decision.action === "none") return;
+
+        const broadcast = (message: Record<string, unknown>): void => {
+            this.io.to("authorized_room").emit("message.upsert", { Type: "ota_status", Message: { ...message, at: Date.now() } });
+        };
+
+        if (decision.action === "complete") {
+            logger.info({ deviceId, target, version: decision.version }, "[OTA] the board came back with the new firmware");
+            broadcast({ deviceId, target, version: decision.version, status: "success", source: "reboot" });
+            await this.raiseAlert("info", `Firmware updated on ${deviceId}`,
+                `The board rebooted into ${decision.version} — the update is installed and running.`, deviceId, 0);
+            return;
+        }
+
+        if (decision.action === "gave-up") {
+            logger.warn({ deviceId, target, version: decision.version, attempts: decision.attempts }, "[OTA] giving up on a board");
+            broadcast({ deviceId, target, version: decision.version, status: "failed", source: "gave-up" });
+            await this.raiseAlert("warning", `Firmware update failed on ${deviceId}`,
+                `Still running ${hello.firmware || "an unknown build"} after ${decision.attempts} attempts to install ${decision.version}, so the queued image was dropped. ` +
+                `Plug the board in and flash it once over USB, then upload a fresh image and trigger the update again.`,
+                deviceId, 0);
+            return;
+        }
+
+        // action === "push": the board is online but runs something else.
+        // Give it a moment to settle (boot Wi-Fi, field-map sync) before the update.
+        const build = decision.build;
+        const timer = setTimeout(() => {
+            try {
+                this.io.to(socket.id).emit("control_command", { command: FirmwareRelease.otaCommand(build) });
+                firmware.notePushed(deviceId, build.target, build.version);
+                logger.info({ deviceId, target: build.target, version: build.version }, "[OTA] queued image sent to a board that just came online");
+                broadcast({ deviceId, target: build.target, version: build.version, status: "queued", source: "reconnect" });
+            } catch (error) {
+                logger.error({ error }, "[OTA] could not send the queued image");
+            }
+        }, 4000);
+        if (typeof timer.unref === "function") timer.unref();
     }
 
     /* ------------------------------------------------------------------ */
@@ -1170,11 +1312,25 @@ export class WSServer {
                     await this.sendFieldMapIfNeeded(socket, deviceId, reportedRev);
                 }
                 this.io.to("authorized_room").emit("message.upsert", { Type: "device_hello", Message: hello });
+
+                /* ---- OTA: does this board still need the queued image? ---- */
+                await this.handleFirmwareHello(socket, deviceId, hello);
                 await this.broadcastStatus();
             } catch (error) {
                 logger.error({ error }, "device_hello handling failed");
             }
         });
+
+        /* ------------------------------------------------------------------ */
+        /* OTA firmware updates                                               */
+        /*                                                                     */
+        /* The board flashes itself from this server, so success is only       */
+        /* "real" once the board is back and reports the new build - that is   */
+        /* why FirmwareRelease keeps the queue entry until then rather than    */
+        /* trusting the device's own report.                                   */
+        /* ------------------------------------------------------------------ */
+
+        socket.on("ota_status", (raw: any) => this.handleOtaStatus(String(socket.data.deviceId || ""), raw));
 
         socket.on("message.upsert", async (raw: RobotMessage) => {
             try {

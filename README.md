@@ -34,6 +34,7 @@ relays live messages between the ESP32 and authorized dashboard/mobile clients.
 - [Known Issues / To Do](#known-issues--to-do)
 - [Team](#team)
 - [License & Usage](#license--usage)
+- [Over-the-air (OTA) firmware updates](#over-the-air-ota-firmware-updates)
 
 ---
 
@@ -721,6 +722,89 @@ exact `.env` block, including the tunnel command for the VPS, are in
 | `bash deploy/rollback.sh` | same thing, from the repository copy |
 
 ---
+
+<!-- Inserted into README.md by add-ota-readme.js — the section that documents
+     the over-the-air firmware update feature (§ "Over-the-air (OTA) firmware updates"). -->
+
+## Over-the-air (OTA) firmware updates
+
+The operator uploads a compiled `.bin` once and presses **Update**; every board of
+that target downloads it from this server, flashes itself and reboots. No USB
+cable, and no internet access needed on the field side — the board fetches the
+image from the very server it already talks to.
+
+### Two ways to trigger it
+
+| Where | Who it is for |
+|---|---|
+| **chrclient → Settings → "Firmware updates (over the air)"** | phone: see which board runs what, press *Update all <target> boards* |
+| **`<server>/admin/firmware`** (built-in page, no build step) | laptop: upload the `.bin` and press Update — this is where images get uploaded |
+
+### Files and storage
+
+Images live in `FIRMWARE_ROOT` (default `<cwd>/firmware`) as
+`<root>/<target>/<version>.bin`, plus an `index.json` holding the metadata and the
+queued update. A `.bin` copied into that folder by hand is picked up on start.
+
+> **VPS deploys:** point `FIRMWARE_ROOT` at the shared directory, or the queue and
+> the images disappear with each release. Add to `.env`:
+> `FIRMWARE_ROOT=/srv/chrserver/shared/firmware`
+
+### Endpoints
+
+| Method & path | Auth | What it does |
+|---|---|---|
+| `GET /api/firmware` | operator session | targets, builds, `pending`, and every board with the firmware it reported |
+| `POST /api/firmware` | operator session | multipart upload: `file` (.bin) + `target` + `version` + `notes` |
+| `POST /api/firmware/update` | operator session | queue + push: `{ target, version? }`, or `target: "*"` for every board (each gets the newest image **of its own target**) |
+| `DELETE /api/firmware/:target/:version` | operator session | remove an image (a queue entry pointing at it is dropped too) |
+| `GET /api/firmware/:target/latest` | device token | what the newest image is (the firmware's own check) |
+| `GET /api/firmware/:target/bin/:version` | device token | the image itself |
+| `GET /admin/firmware` | (session, in the page) | the built-in upload/trigger page |
+
+Upload with curl instead of the page:
+
+```bash
+TOKEN=$(curl -s -X POST https://<server>/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"…","password":"…","nonce":"…"}' | jq -r .token)   # see /admin/firmware for the hashing
+curl -s -X POST https://<server>/api/firmware -H "Authorization: Bearer $TOKEN" \
+  -F target=rover -F version=2026-10-07-arc-avoid -F file=@firmware.bin
+curl -s -X POST https://<server>/api/firmware/update -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"target":"rover"}'
+```
+
+### The rules that keep a bad image off a board
+
+* **Target matching.** An image belongs to a `FW_TARGET` (`rover`, `pump-c3`,
+  `pump-devkit`). The server only sends it to boards that report that target, a
+  rover token may only download rover images and a pump token only pump images,
+  *and* the firmware checks the target again before downloading. Three
+  independent places, because a pump image on the rover is not recoverable over
+  the air.
+* **Queued, not lost.** The request is stored in `index.json`. A board that was
+  switched off gets the update the moment its `device_hello` arrives
+  (a few seconds later, so it can finish booting first).
+* **Success is proven, not claimed.** The queue entry is cleared only when the
+  board comes back reporting the new version. A device that keeps sending
+  failures exhausts `FIRMWARE_OTA_MAX_ATTEMPTS` (default 3) and the operator gets
+  an alert instead of an endless re-flash loop.
+* **A flash is never silent.** `ota_status` messages (`queued`, `starting`,
+  `failed`, `ignored`, `success`) are broadcast to the panel and logged; failures
+  raise an alert.
+
+### Environment
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FIRMWARE_OTA_ENABLED` | `1` | `0` disables the whole feature (uploads and triggers are refused) |
+| `FIRMWARE_ROOT` | `<cwd>/firmware` | where the images and the queue live |
+| `FIRMWARE_OTA_MAX_ATTEMPTS` | `3` | how often one device is asked before the entry is dropped |
+
+### Verifying it
+
+```bash
+npx tsx chrserver-verify-ota.ts    # 47 checks: store, queue, triggers, tokens, downloads, the page
+```
 
 ## Where This Fits in the Overall System
 
