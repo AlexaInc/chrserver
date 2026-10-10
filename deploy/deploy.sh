@@ -320,6 +320,10 @@ done
 
 say "chrserver deploy — release $RELEASE_ID"
 mkdir -p "$RELEASES" "$SHARED/data" "$SHARED/wasession" "$SHARED/public" "$SHARED/webapp-state" "$SHARED/logs"
+# deploy.sh runs as root, but shared/ is the service user's writable state: if
+# any root-owned file lands here (a hand-run `sudo node`, a sudo cp, …) the
+# service hits SQLITE_READONLY / EACCES. Hand the whole tree back on every run.
+chown -R "$(stat -c '%U' "$ROOT")":"$(stat -c '%G' "$ROOT")" "$SHARED" 2>/dev/null || true
 
 # 1. .env first: if it is broken there is no point touching anything else
 if [ -n "$ENV_UPLOAD" ]; then
