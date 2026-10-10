@@ -87,6 +87,11 @@ install_env_file() { # $1 = uploaded env file
     fi
     mv "$ENV_FILE.new" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
+    # deploy.sh usually runs as root, but the systemd service does not: hand
+    # the .env back to the account that owns $ROOT (the one the unit runs as).
+    # Without this, dotenv silently fails to read the file and the server
+    # boots on hardcoded defaults (wrong .env values, webapp paths, …).
+    chown "$(stat -c '%U' "$ROOT")":"$(stat -c '%G' "$ROOT")" "$ENV_FILE" || true
     shred -u "$src" 2>/dev/null || rm -f "$src"
     ok "installed the .env from the GitHub secret ($(wc -l < "$ENV_FILE" | tr -d ' ') lines)"
     ensure_env_lines
