@@ -95,16 +95,14 @@ install_env_file() { # $1 = uploaded env file
 share_models() { # $1 = release dir
     local rel="$1"
     mkdir -p "$SHARED/models"
-    # The plant models (hundreds of MB) are not in the repository; they are
-    # dropped into shared/models once and are then linked into every release.
+    # The plant models live in the repository (src/models) and travel inside
+    # the bundle, so a fresh VPS needs no manual upload: seed shared/models
+    # from the release on every deploy (repo contents win). shared/ keeps
+    # owning the files afterwards — they survive release pruning and every
+    # release just gets the symlink.
     if [ -f "$rel/src/models/manifest.json" ]; then
-        if [ ! -f "$SHARED/models/manifest.json" ]; then
-            cp "$rel/src/models/manifest.json" "$SHARED/models/manifest.json"
-            ok "seeded shared/models/manifest.json"
-        elif [ "$(ls -A "$SHARED/models" 2>/dev/null | wc -l | tr -d ' ')" = "1" ]; then
-            # only the manifest is there so far — keep it fresh
-            cp "$rel/src/models/manifest.json" "$SHARED/models/manifest.json"
-        fi
+        cp -rf "$rel/src/models/." "$SHARED/models/"
+        ok "shared/models synced from the release ($(ls -A "$SHARED/models" | wc -l | tr -d ' ') entries)"
     fi
     rm -rf "$rel/src/models"
     ln -sfn "$SHARED/models" "$rel/src/models"
@@ -340,7 +338,7 @@ mkdir -p "$REL/src/config"
 ln -sfn "$ENV_FILE" "$REL/src/config/.env"
 ok "src/config/.env -> shared/.env"
 share_models "$REL"
-ok "src/models -> shared/models (put the plant model folders in there, once)"
+ok "src/models -> shared/models (seeded automatically from the repo bundle)"
 # the database path normally comes from the .env; if the operator overrode it to
 # a relative path, keep the file inside shared/ so a pruned release cannot take it
 DBPATH="$(env_value CHR_DB_PATH "$SHARED/data/chr.db")"
