@@ -173,7 +173,7 @@ jobs:
           sed -i 's/\r$//' ~/.ssh/vps_key          # keys pasted with Windows endings
           ssh-keygen -y -f ~/.ssh/vps_key > /dev/null || { echo "::error::the key is not a usable private key"; exit 1; }
           ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          echo "SSH_OPTS=-p ${VPS_PORT} -i ~/.ssh/vps_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" >> "$GITHUB_ENV"
+          echo "SSH_OPTS=-o Port=${VPS_PORT} -i ~/.ssh/vps_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" >> "$GITHUB_ENV"
 
       - name: Upload the bundle and the .env
         env:
@@ -264,7 +264,7 @@ jobs:
           chmod 600 ~/.ssh/vps_key
           sed -i 's/\r$//' ~/.ssh/vps_key
           ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
-          echo "SSH_OPTS=-p ${VPS_PORT} -i ~/.ssh/vps_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" >> "$GITHUB_ENV"
+          echo "SSH_OPTS=-o Port=${VPS_PORT} -i ~/.ssh/vps_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" >> "$GITHUB_ENV"
 
       - name: Roll back on the VPS
         env:
