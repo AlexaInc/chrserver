@@ -12,8 +12,8 @@
 #        in place, so a half-finished deploy can never break the running server)
 #     2. installs the .env (from the GitHub secret) into shared/.env, normalises
 #        CRLF from Windows, and makes <release>/src/config/.env point at it
-#     3. shares state between releases: the SQLite database, the WhatsApp
-#        session, the served web build, the AI model folder
+#     3. shares state between releases: the SQLite database, scan uploads,
+#        WhatsApp session, served web build, and AI model folder
 #     4. installs production dependencies (npm ci --omit=dev) inside the release
 #     5. flips the `current` symlink and restarts the service
 #     6. waits for /health; if the new release does not answer, it puts the
@@ -66,6 +66,22 @@ ensure_env_lines() {
         fi
     }
     want CHR_DB_PATH      "$SHARED/data/chr.db"        "the SQLite database"
+    # A relative UPLOAD_DIR resolves inside the versioned release (read-only).
+    # Preserve a deliberate absolute override, but normalize a missing/relative
+    # value to durable shared storage so uploaded scans survive release pruning.
+    local upload_dir
+    upload_dir="$(env_value UPLOAD_DIR "")"
+    case "$upload_dir" in
+        /*) ;;
+        *)
+            if grep -qE '^UPLOAD_DIR=' "$ENV_FILE"; then
+                sed -i "s|^UPLOAD_DIR=.*|UPLOAD_DIR=$SHARED/data/uploads|" "$ENV_FILE"
+                ok "moved relative UPLOAD_DIR to shared storage"
+            else
+                want UPLOAD_DIR "$SHARED/data/uploads" "robot and manual scan image uploads"
+            fi
+            ;;
+    esac
     want WA_SESSION_DIR   "$SHARED/wasession"          "the WhatsApp link (do NOT lose this: re-linking needs the phone)"
     want WEBAPP_ROOT      "$SHARED/public"             "the chrclient web build this server serves"
     want WEBAPP_STATE_DIR "$SHARED/webapp-state"       "which web build is on disk already"
@@ -319,7 +335,7 @@ done
 [ -f "$BUNDLE" ] || die "bundle not found: $BUNDLE"
 
 say "chrserver deploy — release $RELEASE_ID"
-mkdir -p "$RELEASES" "$SHARED/data" "$SHARED/wasession" "$SHARED/public" "$SHARED/webapp-state" "$SHARED/logs"
+mkdir -p "$RELEASES" "$SHARED/data/uploads" "$SHARED/wasession" "$SHARED/public" "$SHARED/webapp-state" "$SHARED/logs"
 # deploy.sh runs as root, but shared/ is the service user's writable state: if
 # any root-owned file lands here (a hand-run `sudo node`, a sudo cp, …) the
 # service hits SQLITE_READONLY / EACCES. Hand the whole tree back on every run.
