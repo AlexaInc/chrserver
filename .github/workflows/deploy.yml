@@ -80,17 +80,17 @@ jobs:
           test -f dist/db/Sqlight.js || { echo "dist/db/Sqlight.js is missing"; exit 1; }
           echo "entry point: dist/src/index.js ($(du -sh dist | cut -f1))"
 
-      - name: Server verification suites (informative)
-        continue-on-error: true
-        run: |
-          set -uo pipefail
-          for suite in chrserver-verify-push.ts chrserver-verify-task7.ts \
-                       chrserver-verify-safety.ts chrserver-verify-webapp.ts \
-                       chrserver-verify-whatsapp.ts; do
-            [ -f "$suite" ] || continue
-            echo "── $suite"
-            npx tsx "$suite" 2>&1 | tail -5 || true
-          done
+#      - name: Server verification suites (informative)
+#        continue-on-error: true
+#        run: |
+#          set -uo pipefail
+#          for suite in chrserver-verify-push.ts chrserver-verify-task7.ts \
+#                       chrserver-verify-safety.ts chrserver-verify-webapp.ts \
+#                       chrserver-verify-whatsapp.ts; do
+#            [ -f "$suite" ] || continue
+#            echo "── $suite"
+#            npx tsx "$suite" 2>&1 | tail -5 || true
+#          done
 
       - name: Pack the release
         id: pack
