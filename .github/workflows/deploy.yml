@@ -212,11 +212,23 @@ jobs:
           VPS_USER: ${{ secrets.VPS_USER }}
         run: |
           ssh $SSH_OPTS "$VPS_USER@$VPS_HOST" bash -s <<'REMOTE' || true
+          echo "===== service status ====="
+          sudo -n systemctl --no-pager --full status chrserver cloudflared 2>&1 || true
+          echo
+          echo "===== local origin health (127.0.0.1:8000) ====="
+          curl -sv --max-time 5 http://127.0.0.1:8000/health 2>&1 || true
+          echo
+          echo "===== port 8000 listener ====="
+          sudo -n ss -ltnp '( sport = :8000 )' 2>/dev/null || true
+          echo
+          echo "===== cloudflared ingress (no credentials contents) ====="
+          sudo -n grep -nE '^[[:space:]]*(tunnel:|credentials-file:|- hostname:|service:)' /etc/cloudflared/config.yml 2>/dev/null || true
+          echo
           echo "===== journalctl -u chrserver (last 40) ====="
           sudo -n journalctl -u chrserver -n 40 --no-pager 2>/dev/null || true
           echo
-          echo "===== journalctl -u cloudflared (last 15) ====="
-          sudo -n journalctl -u cloudflared -n 15 --no-pager 2>/dev/null || true
+          echo "===== journalctl -u cloudflared (last 30) ====="
+          sudo -n journalctl -u cloudflared -n 30 --no-pager 2>/dev/null || true
           echo
           echo "===== releases ====="
           ls -1 /srv/chrserver/releases 2>/dev/null | tail -5 || true
