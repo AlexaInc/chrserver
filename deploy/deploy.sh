@@ -43,6 +43,22 @@ die() { fail "$*"; exit 1; }
 
 # ---------------------------------------------------------------- helpers ---
 
+# Files under shared/ must belong to the account that systemd actually runs as,
+# not merely the account that owns the release directory. An empty systemd User
+# means root; without a unit, the direct/nohup fallback runs as this deploy user.
+service_owner() {
+    local user="" group=""
+    if command -v systemctl >/dev/null 2>&1 && systemctl cat "$SERVICE" >/dev/null 2>&1; then
+        user="$(systemctl show -p User --value "$SERVICE" 2>/dev/null || true)"
+        group="$(systemctl show -p Group --value "$SERVICE" 2>/dev/null || true)"
+        [ -n "$user" ] || user="root"
+    else
+        user="$(id -un)"
+    fi
+    [ -n "$group" ] || group="$(id -gn "$user" 2>/dev/null || printf '%s' "$user")"
+    printf '%s:%s' "$user" "$group"
+}
+
 # Read one key from the .env (for the port we should health-check).
 env_value() {
     local key="$1" default="${2:-}"
@@ -83,8 +99,34 @@ ensure_env_lines() {
             ;;
     esac
     want WA_SESSION_DIR   "$SHARED/wasession"          "the WhatsApp link (do NOT lose this: re-linking needs the phone)"
-    want WEBAPP_ROOT      "$SHARED/public"             "the chrclient web build this server serves"
-    want WEBAPP_STATE_DIR "$SHARED/webapp-state"       "which web build is on disk already"
+    # A relative webapp path resolves under releases/<id>, which is read-only.
+    # Keep intentional absolute overrides; otherwise point both writable paths
+    # at shared storage (including values like `public` / `.webapp` in .env).
+    local webapp_root webapp_state
+    webapp_root="$(env_value WEBAPP_ROOT "")"
+    case "$webapp_root" in
+        /*) ;;
+        *)
+            if grep -qE '^WEBAPP_ROOT=' "$ENV_FILE"; then
+                sed -i "s|^WEBAPP_ROOT=.*|WEBAPP_ROOT=$SHARED/public|" "$ENV_FILE"
+                ok "moved relative WEBAPP_ROOT to shared storage"
+            else
+                want WEBAPP_ROOT "$SHARED/public" "the chrclient web build this server serves"
+            fi
+            ;;
+    esac
+    webapp_state="$(env_value WEBAPP_STATE_DIR "")"
+    case "$webapp_state" in
+        /*) ;;
+        *)
+            if grep -qE '^WEBAPP_STATE_DIR=' "$ENV_FILE"; then
+                sed -i "s|^WEBAPP_STATE_DIR=.*|WEBAPP_STATE_DIR=$SHARED/webapp-state|" "$ENV_FILE"
+                ok "moved relative WEBAPP_STATE_DIR to shared storage"
+            else
+                want WEBAPP_STATE_DIR "$SHARED/webapp-state" "which web build is on disk already"
+            fi
+            ;;
+    esac
     [ "$added" -gt 0 ] && ok "added $added missing path setting(s) to shared/.env"
     return 0
 }
@@ -103,14 +145,10 @@ install_env_file() { # $1 = uploaded env file
     fi
     mv "$ENV_FILE.new" "$ENV_FILE"
     chmod 600 "$ENV_FILE"
-    # deploy.sh usually runs as root, but the systemd service does not: hand
-    # the .env back to the account that owns $ROOT (the one the unit runs as).
-    # Without this, dotenv silently fails to read the file and the server
-    # boots on hardcoded defaults (wrong .env values, webapp paths, …).
-    chown "$(stat -c '%U' "$ROOT")":"$(stat -c '%G' "$ROOT")" "$ENV_FILE" || true
+    # The .env must be readable by the actual systemd service account.
+    chown "$SERVICE_OWNER" "$ENV_FILE" || die "could not set .env owner to service account $SERVICE_OWNER"
     shred -u "$src" 2>/dev/null || rm -f "$src"
     ok "installed the .env from the GitHub secret ($(wc -l < "$ENV_FILE" | tr -d ' ') lines)"
-    ensure_env_lines
 }
 
 share_models() { # $1 = release dir
@@ -335,11 +373,13 @@ done
 [ -f "$BUNDLE" ] || die "bundle not found: $BUNDLE"
 
 say "chrserver deploy — release $RELEASE_ID"
+SERVICE_OWNER="$(service_owner)"
+ok "service account: $SERVICE_OWNER"
 mkdir -p "$RELEASES" "$SHARED/data/uploads" "$SHARED/wasession" "$SHARED/public" "$SHARED/webapp-state" "$SHARED/logs"
-# deploy.sh runs as root, but shared/ is the service user's writable state: if
-# any root-owned file lands here (a hand-run `sudo node`, a sudo cp, …) the
-# service hits SQLITE_READONLY / EACCES. Hand the whole tree back on every run.
-chown -R "$(stat -c '%U' "$ROOT")":"$(stat -c '%G' "$ROOT")" "$SHARED" 2>/dev/null || true
+# shared/ contains writable runtime state (SQLite, WhatsApp credentials, web
+# build/state, uploads). Repair the entire tree before restart, based on the
+# actual systemd User/Group rather than the release/root directory owner.
+chown -R "$SERVICE_OWNER" "$SHARED" || die "could not assign shared/ to service account $SERVICE_OWNER"
 
 # 1. .env first: if it is broken there is no point touching anything else
 if [ -n "$ENV_UPLOAD" ]; then
@@ -347,6 +387,11 @@ if [ -n "$ENV_UPLOAD" ]; then
 elif [ ! -s "$ENV_FILE" ]; then
     die "shared/.env is missing and no --env-file was given (add the ENV_CONTENT secret and deploy again)"
 fi
+# Enforce shared paths even when this deploy reuses an existing .env and no new
+# ENV_CONTENT file was supplied. Restore ownership after appending the settings.
+ensure_env_lines
+chown "$SERVICE_OWNER" "$ENV_FILE" || die "could not set .env owner to $SERVICE_OWNER"
+chmod 600 "$ENV_FILE"
 
 # 2. unpack into a fresh release directory
 REL="$RELEASES/$RELEASE_ID"
