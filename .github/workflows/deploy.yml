@@ -2,21 +2,21 @@
 #  chrserver — build on GitHub, deploy to the VPS over SSH
 #
 #  Push to main (or run this workflow by hand) and it will:
-#     1. install the dependencies and compile TypeScript (dist/)
-#     2. run the server verification suites (informative, never blocks)
-#     3. pack the release (dist + db + src + deploy + package files)
-#     4. copy it to the VPS, write src/config/.env from the ENV_CONTENT secret,
-#        install production dependencies, restart the service
-#     5. wait for /health; if the new release does not answer, the VPS script
-#        puts the previous release back automatically
+#      1. install the dependencies and compile TypeScript (dist/)
+#      2. run the server verification suites (informative, never blocks)
+#      3. pack the release (dist + db + src + deploy + package files)
+#      4. copy it to the VPS, write src/config/.env from the ENV_CONTENT secret,
+#         install production dependencies, restart the service
+#      5. wait for /health; if the new release does not answer, the VPS script
+#         puts the previous release back automatically
 #
 #  Required repository secrets (Settings → Secrets and variables → Actions):
-#     VPS_HOST        IP or hostname of the VPS
-#     VPS_USER        SSH user (root, or a user with passwordless sudo)
-#     VPS_SSH_KEY     the private key for that user (whole PEM text)
-#                     — or VPS_SSH_KEY_BASE64 with the base64 of the same file
-#     ENV_CONTENT     the whole .env file, exactly as it should be written to
-#                     src/config/.env (multi-line secret)
+#      VPS_HOST        IP or hostname of the VPS
+#      VPS_USER        SSH user (root, or a user with passwordless sudo)
+#      VPS_SSH_KEY     the private key for that user (whole PEM text)
+#                      — or VPS_SSH_KEY_BASE64 with the base64 of the same file
+#      ENV_CONTENT     the whole .env file, exactly as it should be written to
+#                      src/config/.env (multi-line secret)
 #  Optional secrets: ENV_CONTENT_BASE64
 #  Optional variables: VPS_PORT (default 22), VPS_ROOT (default /srv/chrserver)
 # =============================================================================
@@ -76,8 +76,6 @@ jobs:
       - name: Check the entry point exists
         run: |
           set -euo pipefail
-          # tsc keeps the folder layout: the entry point is dist/src/index.js
-          # (db/ sits outside src/, so the common root is the project root)
           test -f dist/src/index.js || { echo "dist/src/index.js is missing"; exit 1; }
           test -f dist/db/Sqlight.js || { echo "dist/db/Sqlight.js is missing"; exit 1; }
           echo "entry point: dist/src/index.js ($(du -sh dist | cut -f1))"
@@ -146,7 +144,6 @@ jobs:
           fi
           chmod 600 /tmp/chrserver.env
           echo "env lines: $(wc -l < /tmp/chrserver.env | tr -d ' ')"
-          # never print the values, only the keys
           echo "keys: $(grep -oE '^[A-Za-z_][A-Za-z0-9_]*' /tmp/chrserver.env | paste -sd, -)"
           if grep -qiE '^(ADMIN_PASSWORD|ROBOT_TOKEN|PUMP_TOKEN)=?(replace|change-this|$)' /tmp/chrserver.env; then
             echo "::warning::the .env still looks like the placeholder values from .env.example"
@@ -170,7 +167,7 @@ jobs:
             exit 1
           fi
           chmod 600 ~/.ssh/vps_key
-          sed -i 's/\r$//' ~/.ssh/vps_key          # keys pasted with Windows endings
+          sed -i 's/\r$//' ~/.ssh/vps_key
           ssh-keygen -y -f ~/.ssh/vps_key > /dev/null || { echo "::error::the key is not a usable private key"; exit 1; }
           ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
           echo "SSH_OPTS=-o Port=${VPS_PORT} -i ~/.ssh/vps_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" >> "$GITHUB_ENV"
@@ -198,8 +195,24 @@ jobs:
           WORK="\$(mktemp -d)"
           tar -xzf "$SHA" -C "\$WORK" deploy
           SUDO=""; [ "\$(id -u)" = "0" ] || SUDO="sudo -n"
-          \$SUDO bash "\$WORK/deploy/deploy.sh" "$SHA" "${GITHUB_SHA:0:8}" --env-file /tmp/chrserver.env
+          
+          # Fix permissions and ensure data directories have correct permissions for the running service
           ROOT="${VPS_ROOT:-/srv/chrserver}"
+          \$SUDO mkdir -p "\$ROOT/shared/data"
+          
+          # Run actual deploy script
+          \$SUDO bash "\$WORK/deploy/deploy.sh" "$SHA" "${GITHUB_SHA:0:8}" --env-file /tmp/chrserver.env
+          
+          # Ensure current release folder has write permissions for data creation if app creates it inside release directory
+          # (Alternatively, if app runs as a specific user like www-data or root, adjust ownership here)
+          CURRENT_RELEASE="\$(readlink -f "\$ROOT/current")"
+          if [ -n "\$CURRENT_RELEASE" ]; then
+            \$SUDO mkdir -p "\$CURRENT_RELEASE/data"
+            # Adjust to user running the chrserver service (e.g. www-data or current user)
+            SERVICE_USER="\$(stat -c '%U' /etc/systemd/system/chrserver.service 2>/dev/null || echo "$VPS_USER")"
+            \$SUDO chown -R "\$SERVICE_USER:\$SERVICE_USER" "\$ROOT" || true
+          fi
+
           echo
           echo "===== status ====="
           \$SUDO bash "\$ROOT/current/deploy/deploy.sh" --status || true
