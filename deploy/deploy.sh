@@ -312,7 +312,7 @@ prune_releases() {
     done <<< "$dirs"
 }
 
-# ------------------------------------------------------------------ modes ---
+
 
 status_mode() {
     say "chrserver deploy status"
@@ -349,7 +349,7 @@ rollback_mode() {
     exit 0
 }
 
-# ------------------------------------------------------------- main deploy --
+
 
 BUNDLE="${1:-}"
 case "$BUNDLE" in

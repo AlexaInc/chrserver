@@ -9,8 +9,7 @@ import { exec, ChildProcess } from "child_process";
 import {config} from "./config/config";
 import { logger } from "./logger";
 import { CHRDatabase } from "../db/Sqlight";
-// The logger moved to its own module (src/logger.ts) so services can import it
-// without booting this entry point; re-exported here for existing imports.
+
 export { logger } from "./logger";
 
 const server = new Server({ port: config.port, domain: '0.0.0.0' });
@@ -25,16 +24,16 @@ async function startApp() {
     server.setupRoutes(routeoptions);
     server.configureErrorHandling();
 
-    // Web app: look for a newer chrclient web build and serve the newest copy.
-    // Startup is never blocked by this — the server serves whatever build is
-    // already in public/ (if any) while the check runs in the background, and
-    // an unreachable GitHub leaves that copy in place.
+
+
+
+
     WebAppRelease.getInstance().start();
 
-    // Push notifications: the phones that registered a token get an OS-level
-    // notification for every alert the socket layer raises (rain, petrol empty,
-    // failsafe…). Started here so the service holds the database and is ready
-    // before the first alert can happen.
+
+
+
+
     PushService.getInstance({ store: db });
 
     const httpServer = server.app.listen(Number(server.port), server.domain, (): void => {
@@ -70,18 +69,14 @@ async function startApp() {
     const wsServer = new WSServer(httpServer, db);
     wsServer.setup();
 
-    // WhatsApp LAST: it needs the database (owner number + link state) and the
-    // WSServer instance (robot/pump commands). autoStart() only connects when the
-    // DB says the service is enabled AND a session exists on disk — a fresh
-    // install stays idle until an account is paired from Settings → WhatsApp.
+
+
+
     const whatsapp = WhatsAppService.getInstance(logger, db);
 
-    /**
-     * Safety alerts (rain detected, petrol empty) are raised by the socket layer
-     * and delivered here: every saved owner number gets the message. The link is
-     * wired from outside because WhatsAppService imports WSServer, so a direct
-     * import in the other direction would make a cycle.
-     */
+
+
+
     wsServer.ownerNotifier = (text, options) => whatsapp.notifyOwners(text, options);
 
     void whatsapp.autoStart();
@@ -89,7 +84,9 @@ async function startApp() {
 
 void startApp();
 
-/** Kept so existing imports keep working; the app boots the service itself now. */
+
+
+
 export const initWhatsAppOnStartup = async () => {
     await WhatsAppService.getInstance(logger).autoStart();
 };

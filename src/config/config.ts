@@ -1,13 +1,10 @@
 import dotenv from "dotenv";
 import path from "path";
 
-// Project root .env (matches .env.example at the repo root, and the README's
-// documented configuration steps). Previously this resolved to src/config/.env,
-// which meant a normal `.env` at the project root was silently ignored and the
-// server always fell back to hardcoded defaults (wrong ADMIN_*/ROBOT_TOKEN/
-// PUMP_TOKEN — a real client/server/hardware wiring bug: the client would log
-// in with the placeholder admin password and devices with placeholder tokens
-// while the "configured" .env was never actually read).
+
+
+
+
 dotenv.config({
     path: process.env.ENV_FILE || path.resolve(__dirname, ".env")
 });

@@ -1,43 +1,8 @@
 /**
  * src/services/WhatsAppService.ts — chrserver WhatsApp control bot
  * ------------------------------------------------------------------
- * One WhatsApp account is paired to the server (pairing code, no QR scan
- * needed) and can then operate the farm from a chat:
- *
- *   • robot / mission commands   → .mission deploy, .mission_pause, .stop ...
- *   • water pump commands        → .pump_on 60, .pump_off, .pump_auto on ...
- *   • read-only farm data        → .status, .telemetry, .alerts, .reports
- *
- * Design rules (kept deliberately strict — this bot can move hardware):
- *  1. ONLY the owner number stored in the database may issue commands. The
- *     number is saved with its country code (E.164 digits, e.g. 94766045156)
- *     — see db/Sqlight.ts `WhatsAppSettings`, and it is edited from the
- *     client app's Settings screen (or `.owner set <number>` in chat).
- *  2. Every command goes through the SAME entry points the dashboard uses
- *     (WSServer.deployMission / setRobotMode / controlRobot / controlPump),
- *     so robot-online checks, mission planning limits and audit behaviour are
- *     identical no matter where the command came from.
- *  3. Every single outgoing message carries the footer
- *     "Powered by hazu@AlexaInc.github.io".
- *  4. Replies use interactive native-flow buttons: quick replies for the
- *     frequent actions (`.status`, `.pump_on`, `.pump_off`, ...) and a
- *     single_select list for the full command menu. Any reply id is a plain
- *     command, so the same parser handles typed text and button taps
- *     (see alexainc/alexa-v3 src/bot.js + alexainc/baileys-mod).
- *
- * Button payloads follow the shape @alexainc/baileys-mod understands
- * (lib/Utils/messages.js → `interactiveButtons` → nativeFlowMessage):
- *
- *   { name: "quick_reply", buttonParamsJson: JSON.stringify({ display_text, id }) }
- *   { name: "cta_url",     buttonParamsJson: JSON.stringify({ display_text, url, merchant_url }) }
- *   { name: "single_select", buttonParamsJson: JSON.stringify({ title, sections: [{ title, rows: [...] }] }) }
- *
- * Incoming replies arrive as one of:
- *   buttonsResponseMessage.selectedButtonId            (plain buttons)
- *   listResponseMessage.singleSelectReply.selectedRowId (single_select)
- *   templateButtonReplyMessage.selectedId               (template buttons)
- *   interactiveResponseMessage.nativeFlowResponseMessage.paramsJson → .id
- * and all four are normalised back to a command string by parseMessage().
+ * This was created based on alrxainc/alexa-v3.
+ * credit goes to hazu@Alexainc.github.io
  */
 
 import {
@@ -89,13 +54,9 @@ type ButtonReply = {
 /* Number helpers                                                      */
 /* ------------------------------------------------------------------ */
 
-/**
- * Normalise a phone number to E.164 "digital" form: country code included,
- * digits only. `+94 76 604 5156`, `0094 766 045 156` and `94766045156` all
- * become `94766045156`. Local formats (`0766045156`) are rejected because a
- * missing country code makes the bot silently unreachable.
- */
-/** Shown whenever a number is unusable (kept in one place so bot + app agree). */
+
+
+
 export const NO_NUMBER_HINT =
     "Send the number with its country code, digits only — e.g. 94766045156 (local formats like 0766045156 are rejected)";
 
@@ -1272,8 +1233,8 @@ Owner-only. Tap a button, or type the command.
         await this.sendInteractive(jid, {
             text,
             quoted,
-            // Two live buttons (whatever the pump/robot need right now) + the
-            // catalogue, instead of a fixed ON/OFF pair that is wrong half the time.
+
+
             buttons: [
                 ...await this.contextButtons(2),
                 this.listButton("All commands", [
@@ -1412,8 +1373,7 @@ Owner-only. Tap a button, or type the command.
                     title: "Mission",
                     text: `🗺 *Field blocks* — pick the block the robot should patrol.\n${map.blocks.map((b) => `• *${b.name}* (${b.plant}) — id \`${b.id}\``).join("\n")}`,
                     quoted,
-                    // Live mission buttons first (pause/stop while driving, resume
-                    // when paused, deploy when idle) + the block picker.
+
                     buttons: [
                         ...await this.missionRow(2),
                         this.listButton("Choose a block", [
@@ -1507,9 +1467,9 @@ Owner-only. Tap a button, or type the command.
         await this.sendRobotResult(jid, result.success, result.success ? successText : `❌ ${action} failed: ${result.reason}`, quoted);
     }
 
-    /** Generic result reply — the buttons are rebuilt from the state the command
-     *  just produced, so a "Pump ON" result offers "Pump OFF" (and vice versa)
-     *  without a single hardcoded pair. */
+
+
+
     private async sendRobotResult(jid: string, ok: boolean, text: string, quoted: WAMessage, buttons?: any[]): Promise<void> {
         const defaults = ok
             ? await this.contextButtons(3)
@@ -1564,9 +1524,9 @@ Owner-only. Tap a button, or type the command.
         switch (action) {
             case "on": case "start": {
                 const seconds = Math.max(1, Math.min(3600, Number(value) || 60));
-                // `.pump_on 60 force` overrides the rain lock deliberately — the
-                // lock exists so rain cannot be ignored by accident, not so the
-                // operator can be locked out of their own pump.
+
+
+
                 const forceRain = /\bforce\b/i.test(args);
                 const safety = await this.getWs()?.getSafetyState();
                 if (safety?.pumpLocked && !forceRain) {
@@ -1590,9 +1550,9 @@ Owner-only. Tap a button, or type the command.
                     : "🚿 No pump reading stored yet.", quoted);
             }
             case "threshold": {
-                // `.pump threshold 40 [pumpId|blockId]` — the probe lives on the
-                // pump, so the threshold is stored per well; without an id it is
-                // the fleet-wide value every well falls back to.
+
+
+
                 const wellId = args.split(/\s+/)[2];
                 const percent = Math.max(5, Math.min(90, Number(value) || 35));
                 await this.requireDb().setSetting("fleetConfig", {
@@ -1767,7 +1727,8 @@ Owner-only. Tap a button, or type the command.
         });
     }
 
-    /** `.bot` — the WhatsApp service's own ON/OFF switch, from the chat. */
+
+
     private async botCommand(args: string, jid: string, quoted: WAMessage): Promise<void> {
         const [sub = ""] = args.split(/\s+/).filter(Boolean);
         const action = sub.toLowerCase();
@@ -1802,14 +1763,8 @@ Owner-only. Tap a button, or type the command.
         });
     }
 
-    /**
-     * `.owner` — the owner list from chat.
-     *
-     *   .owner                    list every number (+ how many of the 10 are used)
-     *   .owner add 94XXXXXXXXX    add one more number
-     *   .owner remove 94XXXXXXXXX remove one (never the last one)
-     *   .owner set 94XXXXXXXXX    start the list over with a single number
-     */
+
+
     private async ownerCommand(args: string, jid: string, quoted: WAMessage): Promise<void> {
         const [sub = "", value = ""] = args.split(/\s+/).filter(Boolean);
         const action = sub.toLowerCase();
